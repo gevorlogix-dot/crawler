@@ -1,0 +1,15 @@
+playwright>=1.58.0
+pytest>=8.0
+pytest-playwright>=0.7.2
+pytest-html>=4.0
+pytest-rerunfailures>=16.0
+pytest-xdist>=3.8
+requests>=2.32
+
+# audit engine + web interface
+beautifulsoup4>=4.12
+flask>=3.0
+pyspellchecker>=0.8
+# image previews and screenshot compression. Optional — without it the report
+# still ships, with fewer pictures and larger ones.
+pillow>=10.0

@@ -1,0 +1,8 @@
+artifacts/
+__pycache__/
+*.pyc
+.pytest_cache/
+report.html
+
+# machine-local Claude Code permission allowlist (local temp paths, internal hosts)
+.claude/settings.local.json
