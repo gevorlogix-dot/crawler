@@ -131,6 +131,8 @@ def main() -> int:
           f"· {len(result.records)} pages · {result.elapsed_s}s")
     if result.stages:
         print("stages : " + " · ".join(f"{k} {v}s" for k, v in result.stages.items()))
+    for err in getattr(result, "check_errors", ()) or ():
+        print(f"CHECK FAILED: {err}")
     if result.images:
         over = sum(1 for m in result.images.values()
                    if m.get("bytes", 0) > cfg.image_max_kb * 1024)

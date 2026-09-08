@@ -53,6 +53,10 @@ class AuditResult:
     partial_reason: str = ""
     discovered: int = 0
     stages: dict = field(default_factory=dict)
+    # Checks that raised. `run_checks` collects these onto the Ctx precisely so
+    # a rule cannot disappear from a report in silence; without carrying them
+    # here, the Ctx was discarded and they disappeared anyway.
+    check_errors: list = field(default_factory=list)
     # {image url: measurement}, {image url: {b64, mime, …}}, and the screenshots
     # captured for individual findings.
     images: dict = field(default_factory=dict)
@@ -537,6 +541,7 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
               link_hrefs=hrefs, entry_point=entry_point,
               images=images, image_pages=image_pages, vitals=vitals_summary)
     findings = run_checks(ctx)
+    check_errors = list(ctx.check_errors)
     stage("checks")
     order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     findings.sort(key=lambda f: (order.get(f.severity, 9), -f.count))
@@ -577,7 +582,7 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
         started=started.isoformat(), finished=finished.isoformat(),
         elapsed_s=round(time.time() - t0, 1), counts=counts,
         truncated=truncated, partial_reason=partial_reason,
-        discovered=discovered, stages=stages,
+        discovered=discovered, stages=stages, check_errors=check_errors,
         images=images, thumbs=thumbs, shots=shot_list, vitals=vitals_summary)
 
     # The score reads only what the run already collected, so it comes last and
@@ -601,6 +606,12 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
     data_path.write_text(json.dumps({
         "base": cfg.base, "started": result.started, "finished": result.finished,
         "elapsed_s": result.elapsed_s, "method": method, "counts": counts,
+        # A check that raised. `run_checks` records these so a rule cannot
+        # vanish from a report without saying so — but nothing carried them out
+        # of the process, so it vanished anyway. `dictionary_typos` raised
+        # NameError on every run and reported nothing, and the only trace was an
+        # attribute on a Ctx that had already been discarded.
+        "check_errors": list(result.check_errors),
         "stages": stages,
         # Which stages ran, and what the run expected of the host. Without this a
         # reader — and `scripts/score_calibration.py` — cannot tell a ratio that

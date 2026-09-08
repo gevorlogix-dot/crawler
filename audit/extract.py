@@ -16,7 +16,8 @@ from bs4.element import (Comment, Declaration, Doctype, ProcessingInstruction,
                          Script, Stylesheet, TemplateString)
 
 from .config import AuditConfig
-from .copyrules import MOJIBAKE, PLACEHOLDERS, TYPOS, SPELL_WHITELIST
+from .copyrules import (APOSTROPHES, MOJIBAKE, PLACEHOLDERS, TYPOS,
+                        SPELL_WHITELIST, WORD_JOINERS)
 from . import srcset as srcset_mod
 from .fetch import is_page, normalise, refusal, same_site
 from .schema_validate import validate_page
@@ -44,8 +45,40 @@ CHROME_TAGS = ("nav", "header", "footer")
 CHROME_HINTS = ("menu", "navbar", "site-header", "site-footer", "breadcrumb", "sidebar")
 
 
+# A candidate word: two or more letters, apostrophes included so a contraction
+# stays whole. **Two, not three** — `[A-Za-z][A-Za-z']{2,}` was a three-character
+# minimum, so no two-letter word was ever offered to the dictionary. `ff` for
+# "if", `fo` for "of", `ot` for "to" were all invisible, and the dictionary
+# rejects `ff`: that is how "What happens ff a dealership vehicle is not ready
+# for pickup?" stayed in published copy. The same minimum-three-letters mistake
+# `MISSING_SPACE` carried, and its comment warns about, survived here. Single
+# characters stay out — "a", "I" and a list marker's stray letter are not copy.
+WORD_RE = re.compile(r"[A-Za-z][A-Za-z" + WORD_JOINERS + r"]*[A-Za-z]")
+
+
 def _region(el) -> str:
+    """Is this block page copy, or site furniture?
+
+    **`<body>` and `<html>` get no vote.** They *contain* the page's content, so
+    neither can itself be chrome — and their class list is the theme's site-wide
+    flag set, not a statement about this block. A WordPress/Elementor site whose
+    `<body>` carries `mega-menu-menu-1` matched the `menu` hint on every single
+    element, so every block on every page came back `chrome`. The spell check is
+    the only rule gated on `region == "body"`, which made it inert site-wide:
+    **0 words checked across 381 pages**, while the `spelling` metric scored
+    100/100 for it and the calibration script read "no spread in corpus". That is
+    how `What happens ff a dealership vehicle is not ready for pickup?` survived
+    in published copy — the dictionary rejects `ff`; it was never asked.
+
+    A hint is still matched as a substring against the containers in between,
+    which is right for `site-header` and `elementor-location-footer`. It does
+    mean a content wrapper named `no-sidebar` or `sidebar-none` would read as
+    chrome — not observed on any audited site, and noted here rather than fixed
+    blind, because speculative changes to this classifier cost real findings.
+    """
     for parent in el.parents:
+        if parent.name in ("body", "html") or parent.name is None:
+            break
         if parent.name in CHROME_TAGS:
             return "chrome"
         ident = (" ".join(parent.get("class") or []) + " " + (parent.get("id") or "")).lower()
@@ -112,6 +145,17 @@ def text_blocks(soup: BeautifulSoup) -> list[tuple[str, str, str, list[str]]]:
             continue
         blocks.append((_region(el), el.name, t, runs))
     return blocks
+
+
+def _ascii_quotes(word: str) -> str:
+    """`driver’s` -> `driver's`.
+
+    The dictionary's word list stores contractions and possessives with the
+    ASCII apostrophe; published copy writes them with the typographic one. They
+    are the same word, and asking about the curled form marks all of them
+    unknown.
+    """
+    return re.sub("[" + APOSTROPHES + "]", "'", word)
 
 
 def _around(text: str, start: int, end: int, pad: int = 34) -> str:
@@ -191,6 +235,117 @@ def adjacency_slips(runs: list[str]) -> list[tuple[str, str, str]]:
             if any(a <= m.start() < b for a, b in ents):
                 continue
             out.append(("missing-space", m.group(0), run))
+    return out
+
+
+def spelling_slips(blocks, url: str, spell) -> list[dict]:
+    """Words no dictionary knows that sit one edit from a word it does.
+
+    A whole page at a time, deliberately: a word cannot be judged from one
+    block. `blocks` is `text_blocks` output; only `region == "body"` is read,
+    because furniture is not copy.
+
+    Four gates, each one a measured false-positive class. On the site this was
+    written against, the ungated rule reported 35 words of which two were real
+    typos; gated it reports one, and that one is the typo.
+
+    1. **The page's own vocabulary.** A word its URL names is its subject.
+       `Broomfield` — a real Colorado city, one edit from `Bloomfield` — while
+       the site publishes `/broomfield-car-transport/`.
+    2. **Case, read across the whole page.** A word never written in lower case
+       is a name. The old test was "capitalised and not at the start of the
+       text", which is position-dependent — and a name in a testimonial block
+       *is* at the start of its own block, so `Enies B Burton III`, `Chadley M
+       Hall`, `Rey Valentin`, `Axel`, `Jolie Miller`, `Maddison`, `Karim` and
+       `Sarro` were reported as misspellings of `denies`, `charley`, `red`,
+       `axe`, `julie`, `madison`, `karin` and `sarre`. An internal capital is a
+       brand for the same reason — `iDrive` and `xDrive` begin lower case, so
+       prose rules read them as prose and offered "drive".
+    3. **The dictionary, asked with the apostrophe normalised to ASCII.** Its
+       word list stores `you'll` and `driver's`; published copy writes them with
+       a typographic curl. Unnormalised, every contraction and possessive on the
+       site came back unknown — 30 of 34 words on the first accurate run.
+    4. **A real word one edit away**, which is what a typo *is*, and what
+       separates one from a name the dictionary simply lacks: `ff` has `if`,
+       `of` and `off`; `jonesboro`, `owensboro`, `gulfport`, `asheville` and
+       `ecoboost` have nothing at all. It costs almost no recall — `vehcile`,
+       `transprot`, `avalable`, `seperate`, `definately` and `managment` all
+       keep a suggestion — and it makes the finding actionable, because the
+       suggestion goes in the message.
+
+    The cost of gate 2 is a typo that only ever appears capitalised:
+    `Motorcyles We Ship` is indistinguishable from a name here. The curated
+    `TYPOS` list is matched regardless of case and is where that one belongs.
+    """
+    if spell is None:
+        return []
+    # Gate 1, from the URL the page is published at.
+    proper: set[str] = set(re.findall(r"[a-z]{3,}", urlparse(url).path.lower()))
+    candidates: dict[str, dict] = {}
+    upper_seen: set[str] = set()
+    lower_seen: set[str] = set()
+
+    for region, tag, text, _runs in blocks:
+        if region != "body":
+            continue
+        where = f"{region}:{tag}"
+        for m in WORD_RE.finditer(text):
+            w = m.group(0)
+            lw = w.lower().strip(APOSTROPHES)
+            if len(lw) < 2 or lw in SPELL_WHITELIST:
+                continue
+            if any(c.isupper() for c in w[1:]):
+                proper.add(lw)          # a camelCase brand
+                continue
+            (upper_seen if w[0].isupper() else lower_seen).add(lw)
+            hit = candidates.get(lw)
+            if hit is None:
+                candidates[lw] = {"n": 1, "text": text, "where": where,
+                                  "at": m.start(), "end": m.end()}
+            else:
+                hit["n"] += 1
+
+    if not candidates:
+        return []
+    names = {w for w in upper_seen if w not in lower_seen}      # gate 2
+    askable = {w: _ascii_quotes(w) for w in candidates
+               if w not in proper and w not in names}
+    unknown = set(spell.unknown(list(askable.values())))        # gate 3
+    freq = spell.word_frequency
+
+    out = []
+    for word, plain in askable.items():
+        if plain not in unknown:
+            continue
+        near = (spell.candidates(plain) or set()) - {plain}     # gate 4
+        if not near:
+            continue
+        # Hyphenation is a house style, not a spelling. The dictionary carries
+        # the closed form of most compounds, so it offered `antilock` for
+        # `anti-lock`, `pickup` for `pick-up`, `nonrefundable` for
+        # `non-refundable` — 13 words on one site, every one correct English.
+        # (The hyphen has to stay *inside* the word regardless: split on it and
+        # `carry-ons` arrives as `ons`, a "misspelling" of "on".)
+        bare = plain.replace("-", "")
+        if any(c.replace("-", "") == bare for c in near):
+            continue
+        # A possessive whose base the dictionary knows. It lacks `else's`, and
+        # "someone else's hands" is not a misspelling of `elise's`.
+        if plain.endswith("'s") and spell.known([plain[:-2]]):
+            continue
+        # Ranked by how common the word is, not alphabetically: for `ff`,
+        # sorted() offers "af, cf, eff", which helps nobody, where frequency
+        # offers "of, if, off" — the actual correction.
+        ranked = sorted(near, key=lambda c: (-freq[c], c))[:3]
+        hit = candidates[word]
+        suggest = ", ".join(f"\u201c{c}\u201d" for c in ranked)
+        out.append({
+            "word": word, "n": hit["n"], "text": hit["text"],
+            "where": hit["where"], "suggestions": ranked,
+            "detail": (f"\u201c{word}\u201d is not a word; did you mean "
+                       f"{suggest}? In: \u201c"
+                       f"{_around(hit['text'], hit['at'], hit['end'])}\u201d"),
+        })
     return out
 
 
@@ -445,13 +600,9 @@ def analyse(sess, url: str, cfg: AuditConfig, spell=None) -> dict:
             seen.add(("caps", where, text[:30]))
             add("style", "Sentence set entirely in capitals", text, where)
 
-        if spell is not None and region == "body":
-            for w in re.findall(r"[A-Za-z][A-Za-z']{2,}", text):
-                lw = w.lower().strip("'")
-                if lw in SPELL_WHITELIST or (w[0].isupper() and not text.startswith(w)):
-                    continue
-                if spell.unknown([lw]):
-                    rec["unknown_words"][lw] = rec["unknown_words"].get(lw, 0) + 1
+    for slip in spelling_slips(blocks, url, spell):
+        rec["unknown_words"][slip["word"]] = slip["n"]
+        add("spelling", slip["detail"], slip["text"], slip["where"])
 
     # ---------------------------------------------------------- links
     internal, external, no_name = 0, 0, 0

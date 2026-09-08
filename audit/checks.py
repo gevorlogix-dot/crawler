@@ -375,6 +375,61 @@ def placeholder_text(ctx: Ctx):
 
 
 @check
+def dictionary_typos(ctx: Ctx):
+    """Words no dictionary knows that sit one edit from a word it does.
+
+    Separate from `CNT-04`, which matches a curated list of unambiguous
+    misspellings. This one is the open-ended half: it reads every word of body
+    copy, so it finds the slip nobody thought to list — `ff` for "if" — and it
+    is stated with the suggestion so it can be acted on without re-reading the
+    page.
+
+    It was silent for the life of the tool. `extract._region` marked every block
+    of a WordPress/Elementor site as chrome, because the `<body>` class carried
+    `mega-menu-menu-1` and the hint `menu` matched it, and the dictionary check
+    is the only rule gated on `region == "body"`: 0 words checked across 381
+    pages. `unknown_words` was then written and read by nothing.
+    """
+    # The site's own vocabulary, taken from every URL it publishes. `extract`
+    # already exempts a word the page's *own* slug names; this is the rest of
+    # that idea, and only the crawl knows it. A state page listing the cities it
+    # serves reported `Broomfield` — a real Colorado city, one edit from
+    # `Bloomfield` — while the site publishes `/broomfield-car-transport/`. That
+    # was the last false positive on a 381-page site. A slip that also appears
+    # in a slug is suppressed here, which is the right trade: a typo in a URL is
+    # a louder problem than a typo in a sentence, and it is not this check's.
+    # From every URL the crawl saw, not just the pages that returned HTML: a
+    # URL names its subject whether or not the page behind it rendered.
+    vocab = {w for r in ctx.records
+             for w in re.findall(r"[a-z]{3,}", urlparse(r["url"]).path.lower())}
+
+    def word_of(hit) -> str:
+        return hit.detail.split("”")[0].lstrip("“")
+
+    hits = [h for h in ctx.findings_of("spelling") if word_of(h) not in vocab]
+    if not hits:
+        return None
+    words = sorted({word_of(h) for h in hits})
+    return Finding(
+        "CNT-11", "low", "Content and copy",
+        f"{len(words)} word{'s' if len(words) != 1 else ''} in body copy "
+        "no dictionary recognises",
+        "Each is absent from the dictionary <em>and</em> sits one edit from a "
+        "word that is in it, which is what separates a typo from a brand or "
+        "place name the dictionary simply lacks: "
+        + ", ".join(f"<code>{w}</code>" for w in words[:6])
+        + (f" and {len(words) - 6} more" if len(words) > 6 else "") + ".",
+        "A typo in body copy is read by every visitor and by every crawler. It "
+        "costs nothing in ranking terms on its own, and a great deal in how the "
+        "page reads — a misspelled word in a heading or an FAQ question is the "
+        "kind of thing a prospect notices and a competitor does not have.",
+        "Fix each one in the CMS. Where the word is deliberate — a brand, a "
+        "model name, a piece of jargon — add it to "
+        "<code>copyrules.COMMON_WEB_WORDS</code> so it stops being reported.",
+        hits)
+
+
+@check
 def misspellings(ctx: Ctx):
     hits = ctx.findings_of("misspelling")
     if not hits:

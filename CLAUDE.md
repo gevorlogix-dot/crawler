@@ -317,6 +317,11 @@ it prevents:
   vocabulary (`position`'s domain, `Thing` in `itemListElement`'s range, that
   schema.org publishes no required flag at all), so a schema.org release that
   moves any of them fails loudly instead of the report going quiet — or noisy.
+- `test_spellcheck.py` — the dictionary check, and the four independent faults
+  that each silenced it: `<body>` voting on chrome, the three-letter minimum,
+  `unknown_words` being dead data, and a `NameError` nothing carried out of the
+  run. The other 40 tests are precision, one per measured false-positive class,
+  with the recall cost of the near-miss gate pinned beside them.
 - `test_false_positives.py` — the crawler's own trailing slash, the framework
   catch-all read as a WordPress route, the hostname guess that capped a QA host
   at 25/100, the `aria-hidden` controls counted as unlabelled, and the WAF
@@ -399,6 +404,88 @@ it prevents:
   lists `example.com` was audited as two sites: 77 pages under one spelling and 107
   under the other, the same pages measured twice, and 89 of them reported
   unreachable from a homepage that links to them.
+
+### The dictionary spell check, and why it found nothing (`CNT-11`)
+
+A reader pointed at a published FAQ question: **"What happens ff a dealership
+vehicle is not ready for pickup?"** The dictionary rejects `ff` and offers `of`,
+`if`, `off`. The tool had audited that page and said nothing. **Four** separate
+faults, each of which alone was enough to silence the rule — which is why it
+stayed silent for the life of the tool while `spelling` scored 100/100 and
+`score_calibration.py` read "no spread in corpus".
+
+- **`<body>` and `<html>` get no vote on whether a block is chrome**
+  (`extract._region`). They *contain* the page's content, so neither can itself
+  be chrome, and their class list is the theme's site-wide flag set rather than a
+  statement about this block. A WordPress/Elementor `<body>` carries
+  `mega-menu-menu-1`, the hint `menu` matched it, and **every block on every
+  page** came back `chrome`. The dictionary check is the only rule gated on
+  `region == "body"`: **0 words checked across 381 pages.** Real chrome is still
+  caught by the containers in between — on the page that prompted this, 306 of
+  364 blocks, via a `menu` class (250), `<footer>` (26), `<header>` (23) and a
+  `breadcrumb` class (7). A hint is still a substring match there, so a wrapper
+  named `no-sidebar` would read as chrome; not observed on any audited site, and
+  noted rather than fixed blind.
+- **Two letters, not three.** `[A-Za-z][A-Za-z']{2,}` is a three-character
+  minimum, so no two-letter word was ever offered to the dictionary — `ff`,
+  `fo`, `ot` were invisible. This is the **same** minimum-three-letters mistake
+  `MISSING_SPACE` carried and that its own comment warns about, repeated in the
+  next rule down.
+- **`unknown_words` was written and read by nothing.** Both the `spelling`
+  metric and `CNT-02` use the curated `TYPOS` list, so even with the two above
+  fixed the word surfaced nowhere. `CNT-11` is the finding that reports it.
+- **`dictionary_typos` raised `NameError` on every run.** `run_checks` collects
+  a raising check onto `ctx.check_errors` precisely so a rule cannot vanish from
+  a report in silence — and nothing carried that list out of the process, so it
+  vanished in silence. `AuditResult.check_errors` now carries it, `data.json`
+  records it, and the CLI prints `CHECK FAILED:`.
+
+**Precision is the other half, and it is where the work was.** Fixing the region
+bug turned a rule that checked no words into one reporting **35, of which two
+were real**. A rule at 6% precision is worse than a silent one — a reader who
+finds 33 non-faults stops reading the section. Each gate below is one measured
+false-positive class, and together they take the same site to **one word, which
+is the typo**:
+
+| Gate | What it removes | Measured |
+|---|---|---|
+| The page's own URL slug | its subject, e.g. `Broomfield` | 1 |
+| Case across the whole page | names in testimonial blocks — `Enies`, `Chadley`, `Rey`, `Axel`, `Jolie`, `Maddison`, `Karim`, `Sarro` — plus `AMPM`, `PCS`, `NAIC` | 15 |
+| An internal capital | camelCase brands: `iDrive`, `xDrive`, `kWh` | 3 |
+| Apostrophe normalised to ASCII | every contraction and possessive | 30 of 34 |
+| A real word one edit away | names the dictionary simply lacks: `jonesboro`, `gulfport`, `asheville`, `ecoboost` | 26 |
+| Hyphen kept inside the word | `carry-ons` arriving as `ons` | 2 |
+| A hyphenated suggestion that is the same letters | house style: `antilock` for `anti-lock`, `pickup` for `pick-up` | 13 |
+| A possessive whose base is known | `else's` | 1 |
+| `COMMON_WEB_WORDS`, with plurals generated | units and compounds: `rpm`, `kwh`, `lbs`, `cupholders`, `seatbacks`, `onsite` | 12 |
+
+Rules worth keeping in mind:
+
+- **Case is read across the whole page, never from one block.** The old test was
+  "capitalised, and not at the start of the text" — position-dependent, and a
+  name in a testimonial block *is* at the start of its own block. A word the
+  page never writes in lower case is a name; one it writes both ways is an
+  ordinary word that happened to begin a sentence, and stays checked.
+- **A near miss is what a typo *is*.** It is the gate that separates a slip from
+  an unlisted proper noun, and it costs almost no recall: `vehcile`,
+  `transprot`, `avalable`, `seperate`, `definately` and `managment` all keep a
+  distance-1 suggestion. It also makes the finding actionable, because the
+  suggestion goes in the message — **ranked by word frequency, not
+  alphabetically**. For `ff` the distance-1 set sorted alphabetically offers
+  "af, cf, eff", which reads like noise; by frequency it offers "of, if, off".
+- **The known cost, and its answer.** A typo that only ever appears capitalised
+  is indistinguishable from a name here: `Motorcyles We Ship`, an H2 on the same
+  site, is not reported by `CNT-11`. The curated `TYPOS` list is matched
+  regardless of case and is where a known misspelling belongs — that one is in
+  it, and `CNT-02` reports it.
+- **`spelling_slips` is a module-level function**, because every other copy rule
+  in `extract.py` is (`adjacency_slips`, `block_text`, `text_blocks`) and each
+  has its own tests. Inline in `analyse` it was reachable only through a live
+  HTTP session, which is exactly why nothing tested it and why four bugs
+  survived in it. `tests/unit/test_spellcheck.py` drives it directly.
+- The `spelling` score metric still measures the curated list only. Folding a
+  newly-live rule into a calibrated window needs the corpus re-audited first —
+  the existing window was measured while this check reported nothing.
 
 ### Discovery: what counts as this site's sitemap (`audit/fetch.py`)
 

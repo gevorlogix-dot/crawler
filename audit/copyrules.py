@@ -20,6 +20,13 @@ TYPOS: dict[str, str | None] = {
     r"\btranspotation\b": "transportation",
     r"\btrasport\w*": "transport",
     r"\bshiping\b": "shipping",
+    # Found in an H2 on a real audited site ("Motorcyles We Ship"). The
+    # dictionary check cannot reach it: the word appears only capitalised there,
+    # which is indistinguishable from a name, so a known misspelling belongs
+    # here — this list is matched regardless of case or position.
+    r"\bmotorcyle\w*": "motorcycle",
+    r"\bmotercycl\w*": "motorcycle",
+    r"\bmotorcylce\w*": "motorcycle",
     r"\bdelivary\b": "delivery",
     r"\brecieve\w*": "receive",
     r"\bseperate\w*": "separate",
@@ -124,7 +131,36 @@ COMMON_WEB_WORDS = {
     "covid", "pre", "re", "co", "non", "multi", "mid", "eco", "vs", "etc", "faq",
     "timelines", "relocations", "nationwide", "doorstep", "roadside", "curbside",
     "onboarding", "workflow", "workflows", "dashboard", "analytics", "chatbot",
+    # Vehicle and logistics vocabulary a general dictionary does not carry.
+    # Every one of these was measured on a real audited site, not guessed.
+    "rv", "rvs", "mph", "mpg", "suv", "suvs", "awd", "fwd", "rwd", "atv", "atvs",
+    "midrange", "rearview", "motorcoaches", "drivetrain",
+    "infotainment", "lowboy", "flatbed", "hatchback", "crossover",
+    "horsepower", "towability", "driveability", "towable", "curb", "dolly",
+    # Units and measures that appear lowercase in running copy. `rpm` was
+    # reported as a misspelling of "rum", `kwh` of "kph", `lbs` of "labs".
+    "rpm", "kwh", "kw", "hp", "lbs", "lb", "kg", "psi", "mpge", "ev", "evs",
+    # Compounds a general dictionary does not carry. Every one measured in real
+    # copy: the dictionary offered "upholders" for `cupholders`, "setbacks" for
+    # `seatbacks`, "onside" for `onsite`, "inboard" for `onboard`, "protestant"
+    # for `protectant`, and — its own gap, not the site's — "attached" for
+    # `attaches`.
+    "cupholders", "cupholder", "seatbacks", "seatback", "uptime", "onsite",
+    "onboard", "protectant", "attaches", "liftgate", "roofline", "powertrain",
+    "timeframe", "timeframes", "underbody", "wheelbase", "ratcheting",
 }
+
+# Both halves of a word the dictionary only knows in the singular, or only in
+# the plural. `timeframes` was whitelisted and `timeframe` was not, so the
+# dictionary was asked about the singular and offered the plural back as the
+# correction. Generated rather than listed, so the two can never drift apart.
+def _with_plurals(words: set[str]) -> set[str]:
+    out = set(words)
+    for w in words:
+        out.add(w + "s")
+        if w.endswith("s") and len(w) > 3:
+            out.add(w[:-1])
+    return out
 
 US_STATES = {
     "alabama", "alaska", "arizona", "arkansas", "california", "colorado", "connecticut",
@@ -136,7 +172,21 @@ US_STATES = {
     "virginia", "washington", "wisconsin", "wyoming", "columbia",
 }
 
-SPELL_WHITELIST = COMMON_WEB_WORDS | US_STATES
+SPELL_WHITELIST = _with_plurals(COMMON_WEB_WORDS) | US_STATES
+
+# Both apostrophes, because published copy uses the typographic one. A candidate
+# pattern that accepts only ASCII `'` splits every contraction at the curl:
+# `isn’t` becomes `isn`, `doesn’t` becomes `doesn`, `you’ll` becomes `you` + `ll`.
+# That was 60 of the 63 occurrences the spell check reported on its first real
+# run — six invented "misspellings", every one of them correct English.
+APOSTROPHES = "'\u2019\u02bc"
+
+# A hyphen joins a word; it does not end one. Splitting on it handed the
+# dictionary the tails of compounds — `carry-ons` became `ons`, `off-roading`
+# became `roading`, and both were reported as misspellings of "on" and
+# "reading". Kept inside the word, `carry-ons` is simply unknown with nothing
+# one edit away, so it falls out at the near-miss gate on its own.
+WORD_JOINERS = APOSTROPHES + "-"
 
 
 def load_spellchecker():
