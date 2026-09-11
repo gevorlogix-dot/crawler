@@ -116,7 +116,8 @@ LINK_STATUS = {f"{BASE}{p}": {"verdict": "ok", "status": 200, "hops": []}
 
 
 def build_ctx(pages=None, *, cfg=None, truncated=False, discovered=0,
-              runtime=RUNTIME, vitals=VITALS, probes=None, link_status=None):
+              runtime=RUNTIME, vitals=VITALS, probes=None, link_status=None,
+              reputation=None):
     pages = pages if pages is not None else PAGES
     cfg = cfg or AuditConfig(base=BASE)
     g = graph_mod.build(pages, BASE)
@@ -124,7 +125,7 @@ def build_ctx(pages=None, *, cfg=None, truncated=False, discovered=0,
                runtime, LINK_STATUS if link_status is None else link_status,
                [{"urls": len(pages)}], "sitemap",
                truncated=truncated, discovered=discovered or len(pages),
-               vitals=vitals)
+               vitals=vitals, reputation=reputation)
 
 
 def test_a_healthy_synthetic_site_scores_well_and_reports_both_categories():

@@ -29,6 +29,7 @@ from flask import Flask, Response, abort, jsonify, redirect, request, url_for
 
 from audit import AuditConfig, run_audit
 from audit.config import IMAGE_MAX_KB
+from audit import reputation as rep_mod
 from audit.theme import (SEVERITIES, css as theme_css, theme_script,
                          theme_toggle)
 
@@ -40,12 +41,45 @@ app = Flask(__name__)
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
 
+# Bumped whenever an option is added to the form. An unchecked box sends
+# nothing — and so does a box that was never rendered, which is what a cached
+# page or an older Re-run button posts. Reading both as "off" silently disables
+# a new stage and produces a report missing a section with nothing to explain
+# it; `_opt` below uses this to tell the two apart.
+FORM_REV = 2
+
+# Options that default to on, and the form revision that first offered each.
+OPT_INTRODUCED = {
+    "check_links": 1, "check_external": 1, "check_runtime": 1,
+    "check_security": 1, "check_images": 1, "capture_shots": 1,
+    "check_reputation": 2,
+}
+
+
+def _opt(name: str) -> bool:
+    """One checkbox, with an absent field read in the light of the form's age."""
+    from flask import request
+
+    if name in request.form:
+        return True
+    try:
+        rev = int(request.form.get("form_rev") or 1)
+    except ValueError:
+        rev = 1
+    # Older than the revision that introduced it: the page never showed the box,
+    # so this is not a decision the user made.
+    return rev < OPT_INTRODUCED.get(name, 1)
+
+
 # Hidden fields that turn every optional stage on. Used by both Re-run buttons,
 # which carry no form of their own.
-RERUN_STAGES = "".join(
-    f'<input type="hidden" name="{name}" value="1">'
-    for name in ("check_links", "check_external", "check_runtime", "check_security",
-                 "check_images", "capture_shots"))
+RERUN_STAGES = (
+    f'<input type="hidden" name="form_rev" value="{FORM_REV}">'
+    + "".join(
+        f'<input type="hidden" name="{name}" value="1">'
+        for name in ("check_links", "check_external", "check_runtime",
+                     "check_security", "check_images", "capture_shots",
+                     "check_reputation")))
 
 
 # ------------------------------------------------------------------ jobs
@@ -320,6 +354,17 @@ def index():
              if rows else
              '<div class="empty">No audits yet. Paste a URL above to run the first one.</div>')
 
+    # Read per request rather than at import, so a key exported after the server
+    # started is still picked up. A toggle that silently does nothing is worse
+    # than no toggle, so the label says which source is actually configured.
+    _keys = rep_mod.keys_present()
+    _have = [n for n, on in (("Google Web Risk", _keys["web_risk"]),
+                             ("VirusTotal", _keys["virustotal"])) if on]
+    REP_KEY_NOTE = (("Also configured: " + " and ".join(_have) + ".") if _have else
+                    "Set <code>WEB_RISK_API_KEY</code> or <code>VT_API_KEY</code> "
+                    "to add Google's licensed answer and VirusTotal's 89-vendor "
+                    "breadth on top.")
+
     body = f"""
 <header class="mast">
   <div class="eyebrow"><span class="k">Site auditor</span><span class="dash"></span>
@@ -332,6 +377,7 @@ def index():
 </header>
 
 <form class="run" method="post" action="{url_for('run')}">
+  <input type="hidden" name="form_rev" value="{FORM_REV}">
   <div class="field">
     <div>
       <label class="k" for="url">Site URL</label>
@@ -384,6 +430,21 @@ def index():
         <span class="d">Any single image above this is reported.</span></label>
     </div>
     <div class="opt">
+      <input type="checkbox" id="check_reputation" name="check_reputation" checked>
+      <label for="check_reputation"><span class="t">Check blocklist reputation</span>
+        <span class="d">Asks Google Safe Browsing, Cloudflare's security resolver
+        and the domain blocklists what they already say about this hostname,
+        ranked by what a listing does to a visitor rather than by how many
+        vendors voted. No API key needed. {REP_KEY_NOTE}</span></label>
+    </div>
+    <div class="opt">
+      <input type="checkbox" id="check_reputation_feeds" name="check_reputation_feeds">
+      <label for="check_reputation_feeds"><span class="t">…and the downloadable feeds</span>
+        <span class="d">Also checks URLhaus and Phishing Army. Multi-megabyte
+        downloads, cached for 12 hours. Phishing Army is CC&nbsp;BY-NC &mdash;
+        check its licence before relying on it in paid work.</span></label>
+    </div>
+    <div class="opt">
       <input type="checkbox" id="capture_shots" name="capture_shots" checked>
       <label for="capture_shots"><span class="t">Screenshot the findings</span>
         <span class="d">Photographs each problem in place — the heavy image, the
@@ -410,14 +471,17 @@ def run():
         cfg = AuditConfig(
             base=request.form.get("url", ""),
             max_pages=max(1, min(5000, int(request.form.get("max_pages") or 600))),
-            check_links=bool(request.form.get("check_links")),
-            check_external_links=bool(request.form.get("check_external")),
-            check_runtime=bool(request.form.get("check_runtime")),
-            check_security=bool(request.form.get("check_security")),
-            check_images=bool(request.form.get("check_images")),
+            check_links=_opt("check_links"),
+            check_external_links=_opt("check_external"),
+            check_runtime=_opt("check_runtime"),
+            check_security=_opt("check_security"),
+            check_images=_opt("check_images"),
             image_max_kb=max(1, min(100_000,
                                     int(request.form.get("image_max_kb") or IMAGE_MAX_KB))),
-            capture_shots=bool(request.form.get("capture_shots")),
+            capture_shots=_opt("capture_shots"),
+            check_reputation=_opt("check_reputation"),
+            check_reputation_feeds=bool(request.form.get("check_reputation_feeds")),
+            reputation_cache="artifacts/reputation_feeds",
             expect_noindex=True if request.form.get("staging") else None,
         )
     except ValueError as exc:

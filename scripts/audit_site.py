@@ -44,6 +44,17 @@ def main() -> int:
                          "(roughly doubles the image stage on a site where every "
                          "image carries a srcset; hidden inside the concurrent "
                          "window on a normal run)")
+    ap.add_argument("--no-reputation", action="store_true",
+                    help="skip the third-party blocklist lookup. It only runs when "
+                         "WEB_RISK_API_KEY (Google Web Risk: 100k lookups/month "
+                         "free, licensed for commercial use) or VT_API_KEY "
+                         "(VirusTotal: 4 requests/minute, non-commercial only) is "
+                         "set, and it sends the audited hostname to that service")
+    ap.add_argument("--reputation-feeds", action="store_true",
+                    help="also check the free downloadable blocklists (URLhaus, "
+                         "Phishing Army). Multi-megabyte downloads, cached for 12 "
+                         "hours; Phishing Army is CC BY-NC, so read its licence "
+                         "before relying on it in paid work")
     ap.add_argument("--no-shots", action="store_true",
                     help="skip the screenshots embedded in the report")
     ap.add_argument("--shots", type=int, default=12,
@@ -71,6 +82,9 @@ def main() -> int:
         image_max_kb=max(1, args.image_max_kb),
         image_variant_limit=0 if args.no_retina else AuditConfig.image_variant_limit,
         capture_shots=not args.no_shots,
+        check_reputation=not args.no_reputation,
+        check_reputation_feeds=bool(args.reputation_feeds),
+        reputation_cache="artifacts/reputation_feeds",
         shot_limit=max(0, args.shots),
         expect_noindex=True if args.staging else None,
     )
@@ -100,6 +114,24 @@ def main() -> int:
             value = " --" if cat.total is None else f"{cat.total:>3}"
             print(f"    {cat.name:<14}{value}/100  weight {cat.weight}"
                   f"   {cat.grade if cat.total is not None else cat.note[:48]}")
+        for posture in (getattr(score, "spam", None),
+                        getattr(score, "phishing", None)):
+            if posture is None:
+                continue
+            value = " --" if posture.score is None else f"{posture.score:>3}"
+            label = posture.name.replace(" posture", "")
+            print(f"    {label:<14}{value}/100  unweighted"
+                  f"   {posture.grade} · {len(posture.measured)} checks")
+        rep = getattr(score, "reputation", None)
+        if rep is not None:
+            # "unweighted" printed in the line itself, not in a footnote: a
+            # number in this block is read as part of the total otherwise.
+            value = " --" if rep.score is None else f"{rep.score:>3}"
+            print(f"    {'Reputation':<14}{value}/100  unweighted"
+                  f"   {rep.grade} · {rep.sources_read} source"
+                  f"{'s' if rep.sources_read != 1 else ''} read"
+                  + (f", {rep.sources_unread} unreadable"
+                     if rep.sources_unread else ""))
         for cat in score.categories:
             # A category with its own aggregation (performance is the median of
             # per-page scores) has no group deficits that add up to its total, so

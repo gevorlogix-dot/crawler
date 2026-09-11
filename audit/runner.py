@@ -12,7 +12,9 @@ from pathlib import Path
 
 from . import graph as graph_mod
 from . import media as media_mod
+from . import mailauth as mail_mod
 from . import probe as probe_mod
+from . import reputation as rep_mod
 from . import runtime as runtime_mod
 from . import schema_validate
 from . import score as score_mod
@@ -57,6 +59,13 @@ class AuditResult:
     # a rule cannot disappear from a report in silence; without carrying them
     # here, the Ctx was discarded and they disappeared anyway.
     check_errors: list = field(default_factory=list)
+    # What third parties already say about this host — `reputation.run()`.
+    # Defaulted because the stage is optional: it needs an API key, and an empty
+    # dict reads as "not measured", never as "clean".
+    reputation: dict = field(default_factory=dict)
+    # The domain's own SPF/DKIM/DMARC/MX records — `mailauth.run()`. Empty means
+    # not measured, never "no records published".
+    mailauth: dict = field(default_factory=dict)
     # {image url: measurement}, {image url: {b64, mime, …}}, and the screenshots
     # captured for individual findings.
     images: dict = field(default_factory=dict)
@@ -239,8 +248,18 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
     # ---------------------------------------------------------- probes
     # Endpoint probes depend on nothing but the hostname, so they run alongside
     # the crawl instead of waiting their turn at the end.
-    probe_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="probe")
+    probe_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="probe")
     probe_future = probe_pool.submit(probe_mod.run, cfg, lambda m: None)
+    # Reputation depends on the hostname alone, so it rides along here too. Two
+    # lookups per source at most, and the whole stage is skipped when no key is
+    # configured — the lookup tells a third party which host is being audited.
+    rep_future = (probe_pool.submit(rep_mod.run, cfg, lambda m: None)
+                  if cfg.check_reputation else None)
+    # The mail records are DNS lookups on the same hostname, so they ride along
+    # here too. Gated on the same toggle: both stages send the hostname to a
+    # third-party resolver, and that is the thing the toggle exists to control.
+    mail_future = (probe_pool.submit(mail_mod.run, cfg, lambda m: None)
+                   if cfg.check_reputation else None)
 
     # ---------------------------------------------------------- extraction
     spell = load_spellchecker()
@@ -525,6 +544,30 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
         probes = probe_future.result(timeout=90)
     except Exception as exc:
         progress(f"probe stage skipped: {exc.__class__.__name__}", 0.90)
+    reputation: dict = {}
+    if rep_future is not None:
+        try:
+            reputation = rep_future.result(timeout=40)
+        except Exception as exc:
+            # A third party being slow or unreachable is not a fact about the
+            # audited site, so it must not become a finding or cost a point.
+            reputation = {"unavailable": [
+                f"the reputation lookup did not complete ({exc.__class__.__name__})"]}
+        for line in reputation.get("unavailable") or []:
+            progress(line, 0.90)
+        if reputation.get("listings"):
+            progress(f"{len(reputation['listings'])} blocklist listing(s), worst "
+                     f"is {reputation.get('worst_tier')}-level", 0.90)
+    mailauth: dict = {}
+    if mail_future is not None:
+        try:
+            mailauth = mail_future.result(timeout=60)
+        except Exception as exc:
+            mailauth = {"unavailable": [
+                f"the mail-record lookup did not complete "
+                f"({exc.__class__.__name__})"], "control_ok": False}
+        for line in mailauth.get("unavailable") or []:
+            progress(line, 0.90)
     probe_pool.shutdown(wait=False)
     stage("browser+probes")
 
@@ -539,7 +582,8 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
               truncated=truncated, discovered=discovered,
               external_status=external_status, link_sources=sources,
               link_hrefs=hrefs, entry_point=entry_point,
-              images=images, image_pages=image_pages, vitals=vitals_summary)
+              images=images, image_pages=image_pages, vitals=vitals_summary,
+              reputation=reputation, mailauth=mailauth)
     findings = run_checks(ctx)
     check_errors = list(ctx.check_errors)
     stage("checks")
@@ -578,7 +622,7 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
 
     result = AuditResult(
         config=cfg, findings=findings, records=records, graph=g, probes=probes,
-        runtime=rt, sitemaps=sitemaps, method=method,
+        reputation=reputation, mailauth=mailauth, runtime=rt, sitemaps=sitemaps, method=method,
         started=started.isoformat(), finished=finished.isoformat(),
         elapsed_s=round(time.time() - t0, 1), counts=counts,
         truncated=truncated, partial_reason=partial_reason,
@@ -728,6 +772,60 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
                               for e in probes.get("echoed_probes") or []],
             "author_probe": probes.get("author_probe") or {},
             "exposed_users": probes.get("exposed_users") or [],
+        },
+        # Third-party reputation, with the aggregate *and* the per-vendor rows
+        # that produced it — a headline of "4 of 89" whose vendor list is not in
+        # the file cannot be checked, and checking which four is the entire
+        # question. `web_risk_clean` is recorded even when it is True, because a
+        # negative from the list browsers consume is the most useful line here.
+        # `unavailable` says why a lookup did not happen, so a missing verdict is
+        # never mistaken for a clean one.
+        "reputation": {
+            "keys": reputation.get("keys") or {},
+            "queried": reputation.get("queried") or [],
+            "unavailable": reputation.get("unavailable") or [],
+            # Which sources answered and said "not listed". Without this the
+            # file cannot tell a clean result from a check that never ran, and
+            # the negative from the browser-level list is the most useful line
+            # in it.
+            "clean": reputation.get("clean") or {},
+            "web_risk_clean": reputation.get("web_risk_clean"),
+            "engines": reputation.get("engines") or 0,
+            "flagged": reputation.get("flagged") or 0,
+            "worst_tier": reputation.get("worst_tier"),
+            "severity": reputation.get("severity"),
+            "agree": reputation.get("agree") or 0,
+            "listings": reputation.get("listings") or [],
+            "suspicious": reputation.get("suspicious") or [],
+            "categories": reputation.get("categories") or {},
+            "community": {"reputation": reputation.get("reputation"),
+                          "votes": reputation.get("votes") or {}},
+            "age_days": reputation.get("age_days"),
+            "stale": bool(reputation.get("stale")),
+            # The number the report shows, with `weighted_into_overall: false`
+            # stated in the file too — a consumer reading `score` and
+            # `reputation.score` side by side must not add them up.
+            "score": (result.score.reputation.as_dict()
+                      if getattr(result.score, "reputation", None) else None),
+        },
+        # The mail records as published, with the exact lookup that read each
+        # one, plus the two posture scores built from them. `weighted_into_
+        # overall` is false on both, stated in the file, so a consumer cannot
+        # add them to `score.overall`.
+        "mail": {
+            "host": mailauth.get("host", ""),
+            "control": mailauth.get("control", ""),
+            "control_ok": mailauth.get("control_ok"),
+            "lookups": mailauth.get("lookups", 0),
+            "unavailable": mailauth.get("unavailable") or [],
+            **{k: mailauth.get(k) for k in
+               ("spf", "dmarc", "dkim", "mx", "mta_sts", "bimi")
+               if mailauth.get(k) is not None},
+            "spam_score": (result.score.spam.as_dict()
+                           if getattr(result.score, "spam", None) else None),
+            "phishing_score": (result.score.phishing.as_dict()
+                               if getattr(result.score, "phishing", None)
+                               else None),
         },
         "structured_data": {
             "vocabulary": schema_validate.vocab_stamp(),

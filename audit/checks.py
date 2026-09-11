@@ -22,6 +22,7 @@ from typing import Callable
 from urllib.parse import urlparse
 
 from . import media as media_mod
+from . import reputation as rep_mod
 from .config import (DESC_MAX, DESC_MIN, OVERSIZED_FACTOR, SLOW_MS, THIN_WORDS,
                      TITLE_MAX, TITLE_MIN)
 from .schema_validate import vocab_stamp
@@ -64,7 +65,18 @@ class Ctx:
     def __init__(self, cfg, records, graph, probes, runtime, link_status, sitemaps,
                  method, truncated=False, discovered=0, external_status=None,
                  link_sources=None, images=None, image_pages=None, vitals=None,
-                 partial_reason="", link_hrefs=None, entry_point=None):
+                 partial_reason="", link_hrefs=None, entry_point=None,
+                 reputation=None, mailauth=None):
+        # The domain's own mail-authentication records, from `mailauth.run()`.
+        # Empty means not measured, never "no records published" — a missing
+        # record and an unreadable resolver look identical from here.
+        self.mailauth = mailauth or {}
+        # What third parties already say about this host, from
+        # `reputation.run()`. Empty when no API key is configured, and an empty
+        # dict must read as "not measured" rather than "clean": absence of a
+        # listing we never asked for is not a clean bill, so REP-01..REP-03 all
+        # key off the listings themselves and never off a missing one.
+        self.reputation = reputation or {}
         # Why the crawl is only a sample, when it is: the page cap, or a host
         # that refused part of it. Both suppress the reachability checks; they
         # need different sentences in the report.
@@ -342,6 +354,583 @@ def mixed_content(ctx: Ctx):
         "Serve every asset over HTTPS and add a "
         "<code>Content-Security-Policy: upgrade-insecure-requests</code> header.",
         hits)
+
+
+# =====================================================================
+# Reputation and blocklists
+#
+# Three findings over one data set, split by what a listing actually does to a
+# visitor rather than by how many vendors voted. "4 of 89 security vendors
+# flagged this domain" is a number with no denominator worth having — see the
+# module docstring in `audit/reputation.py` — so the aggregate is never the
+# headline, and a browser-level listing is reported even when it is 1 of 89.
+# =====================================================================
+
+def _rep_evidence(rep: dict) -> str:
+    """Every vendor that flagged the host, with the tier it lands in.
+
+    Printed in full rather than sampled, and including the vendors graded as
+    harmless noise, because the tier map is keyed on VirusTotal's spelling of a
+    vendor name: a renamed browser-level vendor would otherwise be silently
+    downgraded to `unknown` with nothing in the report to show it happened.
+    """
+    rows = []
+    for r in (rep.get("listings") or []) + (rep.get("suspicious") or []):
+        note = rep_mod.TIERS.get(r["tier"], (9, ""))[1]
+        rows.append(f"{r['vendor']:<26} {r.get('category', 'malicious'):<10} "
+                    f"{(r.get('result') or '')[:22]:<22} {r['tier']:<8} {note}")
+    # What came back clean matters as much as what did not: a reader dismissing
+    # a feed flag needs to see that the consequential lists were actually asked
+    # and actually answered. And a source we could not read is printed as
+    # unread, never folded in with the passes.
+    if rep.get("clean"):
+        rows.append("")
+        for vendor in sorted(rep["clean"]):
+            rows.append(f"{vendor:<26} not listed")
+    for line in rep.get("unavailable") or []:
+        rows.append(f"{'(not readable)':<26} {line}")
+    if rep.get("engines"):
+        rows.append("")
+        stats = {"flagged": rep.get("flagged", 0), "engines": rep["engines"]}
+        rows.append(f"VirusTotal aggregate: {stats['flagged']} of "
+                    f"{stats['engines']} engines returned 'malicious'")
+    if rep.get("web_risk_clean") is not None:
+        rows.append(f"Google Web Risk: "
+                    f"{'not listed' if rep['web_risk_clean'] else 'LISTED'} "
+                    f"({', '.join(rep.get('queried') or []) or 'no URL queried'})")
+    if rep.get("age_days") is not None:
+        rows.append(f"Newest vendor verdict: {rep['age_days']} days old")
+    if rep.get("reputation") is not None:
+        votes = rep.get("votes") or {}
+        rows.append(f"VirusTotal community score: {rep['reputation']} "
+                    f"({votes.get('harmless', 0)} harmless / "
+                    f"{votes.get('malicious', 0)} malicious votes)")
+    return "\n".join(rows)
+
+
+def _rep_review(rows: list[dict]) -> str:
+    """The dispute route for each vendor that flagged the host.
+
+    Only URLs verified to exist and to accept a review request. A vendor with no
+    verified page is named and nothing is invented for it — a fix that sends the
+    reader to a dead URL costs them more time than one that names the vendor and
+    stops.
+    """
+    out = []
+    for r in rows:
+        url = r.get("dispute") or rep_mod.review_url(r["vendor"])
+        out.append(f"<code>{escape(r['vendor'])}</code>"
+                   + (f" — <a href=\"{escape(url)}\" target=\"_blank\" "
+                      f"rel=\"noopener\">{escape(url)}</a>" if url else
+                      " — look up the vendor's own URL-category tool and submit a "
+                      "recategorisation request"))
+    return "; ".join(out)
+
+
+def _rep_hits(rep: dict, rows: list[dict]) -> list[Hit]:
+    targets = list(dict.fromkeys(
+        r.get("target") or "" for r in rows)) or list(rep.get("queried") or [])
+    by_target: dict[str, list[str]] = {}
+    for r in rows:
+        key = r.get("target") or (targets[0] if targets else "")
+        by_target.setdefault(key, []).append(
+            f"{r['vendor']}: {r.get('detail') or r.get('result') or 'malicious'}")
+    out = []
+    for target in targets:
+        url = target if target.startswith("http") else f"https://{target}/"
+        out.append(Hit(url, "; ".join(by_target.get(target, [])) or "queried"))
+    return out
+
+
+@check
+def blocklisted_in_browsers(ctx: Ctx):
+    """A listing on the one blocklist every major browser consumes."""
+    rep = ctx.reputation
+    rows = [r for r in (rep.get("at_worst") or []) if r["tier"] == "browser"]
+    if not rows:
+        return None
+    vendors = ", ".join(sorted({r["vendor"] for r in rows}))
+    kinds = ", ".join(sorted({r.get("detail") or r.get("result", "") for r in rows}))
+    return Finding(
+        "REP-01", "critical", "Reputation and blocklists",
+        f"{vendors} list{'s' if len(rows) == 1 else ''} this host as malicious",
+        f"The host is on a blocklist browsers consume directly, classified as "
+        f"{escape(kinds)}. {rep_mod.TIERS['browser'][1].capitalize()} — so the "
+        f"measurements everywhere else in this report describe a page most "
+        f"visitors are never shown.",
+        "This is the most destructive state a live site can be in, and it is not "
+        "a ranking problem. Chrome, Safari, Firefox and Android paint a full-page "
+        "warning that most people will not click through, so traffic from search, "
+        "from ads and from links people already have all stop at once. Google "
+        "Search Console raises a security issue against the property, links to the "
+        "domain get warnings in Gmail and in messaging apps, and the listing "
+        "usually outlives the cause by days because it is only re-checked after a "
+        "review is requested.",
+        "Treat it as an incident, in this order. "
+        f"<b>1.</b> Open <a href=\"{rep_mod.SB_STATUS}\" target=\"_blank\" "
+        "rel=\"noopener\">Google's Safe Browsing site status</a> and, in Search "
+        "Console, <em>Security &amp; Manual Actions → Security Issues</em>, which "
+        "names sample URLs — that is the only place the specific evidence is "
+        "published. <b>2.</b> Find the cause on those URLs: an injected script in "
+        "a theme or plugin file, a conditional redirect that only fires for "
+        "search-engine referrers or mobile user agents, an uploaded file in "
+        "<code>/uploads/</code>, a compromised third-party ad or chat script, or "
+        "a login form that imitates another brand. <b>3.</b> Remove it, rotate "
+        "every credential (hosting, CMS admin, database, FTP/SFTP, API keys), and "
+        "update whatever was exploited. <b>4.</b> Only then request a review in "
+        "Search Console. A review requested while the cause is still live resets "
+        "the clock and the next one is slower.",
+        _rep_hits(rep, rows),
+        evidence=_rep_evidence(rep))
+
+
+# How each class of listing is actually cleared. Written per tier because the
+# work is different in each: a spam listing is fixed in DNS and in whatever is
+# sending mail, a web-filter listing by asking the vendor to look again.
+_REP_FIX = {
+    "gateway":
+        "First establish whether it is real. Check Google Safe Browsing and "
+        f"Search Console (<a href=\"{rep_mod.SB_STATUS}\" target=\"_blank\" "
+        "rel=\"noopener\">site status</a>), then look for the things these "
+        "categorisers react to: an injected script, a redirect that only fires "
+        "for search-engine referrers or mobile user agents, an uploaded file "
+        "under <code>/uploads/</code>, an abandoned plugin, a page that "
+        "collects credentials or imitates another brand, or an ad/chat script "
+        "from a third party. Remove the cause before disputing anything. If the "
+        "site is clean, file a recategorisation request with each vendor — they "
+        "own their verdicts and VirusTotal cannot remove them "
+        f"(<a href=\"{rep_mod.VT_FP_DOC}\" target=\"_blank\" "
+        "rel=\"noopener\">their own guidance says so</a>): ",
+    "mail":
+        "This is a mail-reputation problem, not a web one, and it is fixed in "
+        "DNS and at the sender. <b>1.</b> Publish the three records: an "
+        "<code>SPF</code> record listing every service that sends as this "
+        "domain (ending <code>-all</code>, not <code>~all</code>, once you are "
+        "sure the list is complete), <code>DKIM</code> signing on each of them, "
+        "and a <code>DMARC</code> policy — start at <code>p=none; "
+        "rua=mailto:…</code>, read the reports for a fortnight, then move to "
+        "<code>p=quarantine</code> and <code>p=reject</code>. Most list "
+        "operators weigh an unauthenticated domain far more harshly than a "
+        "small volume of complaints. <b>2.</b> Find what sent the mail that "
+        "earned the listing: an unprotected contact or quote form being used as "
+        "a relay is the usual cause on a WordPress site, so add a captcha or "
+        "rate limit, and confirm the form cannot put visitor-supplied text into "
+        "the envelope sender or headers. <b>3.</b> Check whether transactional "
+        "mail is going out from shared hosting IPs; move it to a dedicated "
+        "sending service so the domain's reputation is not pooled with "
+        "everyone else's. <b>4.</b> Only then request delisting — each list "
+        "runs its own lookup and removal page, and a removal requested while "
+        "the cause is live is re-listed within days: ",
+    "endpoint":
+        "Scan the site's files for injected code and check what third-party "
+        "scripts each template loads, since an antivirus verdict usually points "
+        "at a specific file or a specific script rather than the domain. Once "
+        "the site is clean, submit a false-positive report to each vendor — they "
+        "each run their own submission form, and VirusTotal cannot clear a "
+        f"detection it did not make (<a href=\"{rep_mod.VT_FP_DOC}\" "
+        "target=\"_blank\" rel=\"noopener\">their guidance</a>): ",
+}
+
+
+@check
+def blocklisted_by_filters(ctx: Ctx):
+    """Web-filter, mail and endpoint listings — real consequences, no interstitial."""
+    rep = ctx.reputation
+    rows = [r for r in (rep.get("at_worst") or [])
+            if r["tier"] in ("gateway", "mail", "endpoint")]
+    if not rows:
+        return None
+    tier = rows[0]["tier"]
+    vendors = sorted({r["vendor"] for r in rows})
+    consequence = rep_mod.TIERS[tier][1]
+    single = len(vendors) == 1
+    what = (f"{len(vendors)} vendor{'s' if not single else ''} in this class "
+            f"classif{'y' if not single else 'ies'} the host as malicious: "
+            + ", ".join(f"<code>{escape(v)}</code>" for v in vendors)
+            + f". A listing here means {consequence}.")
+    if single:
+        what += (" One vendor on its own is weak evidence — these are automated "
+                 "content categorisers, and they mislabel lead-generation, "
+                 "local-service and newly-registered sites routinely — so this is "
+                 "reported as a thing to check and clear, not as a confirmed "
+                 "compromise.")
+    why = {
+        "gateway": "These vendors sell the web filters and secure gateways that "
+                   "sit in front of corporate, school and ISP networks, and they "
+                   "resell their categorisation to each other. A blocked visitor "
+                   "does not see an error from your site — they see a block page "
+                   "from their own IT department, and nothing reaches your "
+                   "analytics. B2B traffic and form fills simply go missing, which "
+                   "is why this is usually found months late by someone "
+                   "wondering why a channel died.",
+        "mail": "A domain on a mail blocklist loses the transactional mail the "
+                "site depends on: quote confirmations, password resets and "
+                "notification mail are rejected at the gateway or filed as spam. "
+                "The sender sees a successful form submission and the customer "
+                "never hears back.",
+        "endpoint": "Antivirus installed on the visitor's own machine will "
+                    "interrupt the page or block a download from it. The reach is "
+                    "narrower than a browser listing, but the visitor sees a "
+                    "malware warning attached to your brand, which is the part "
+                    "that does not wash out.",
+    }[tier]
+    return Finding(
+        "REP-02", rep.get("severity") or "medium", "Reputation and blocklists",
+        f"{len(vendors)} {tier}-level vendor{'s' if not single else ''} "
+        f"classif{'y' if not single else 'ies'} this host as malicious",
+        what, why,
+        _REP_FIX[tier] + _rep_review(rows) + ". Re-check in two weeks; a vendor "
+        "that does not retract is worth naming in a note to the client, because "
+        "it will keep appearing on aggregate reports.",
+        _rep_hits(rep, rows),
+        evidence=_rep_evidence(rep))
+
+
+@check
+def blocklist_feed_noise(ctx: Ctx):
+    """Flags from aggregate feeds only — reported so it can be dismissed."""
+    rep = ctx.reputation
+    rows = [r for r in (rep.get("at_worst") or [])
+            if r["tier"] in ("feed", "unknown")]
+    if not rows:
+        return None
+    vendors = sorted({r["vendor"] for r in rows})
+    named = [v for v in vendors if rep_mod.tier_of(v) == "feed"]
+    unknown = [v for v in vendors if rep_mod.tier_of(v) == "unknown"]
+    total = rep.get("engines") or 0
+    ratio = (f"{rep.get('flagged', len(vendors))} of {total} engines"
+             if total else f"{len(vendors)} engines")
+    clean = rep.get("web_risk_clean")
+    what = (f"{ratio} on VirusTotal return <code>malicious</code> for this host, "
+            f"and every one of them is an aggregate feed with no consumer that "
+            f"blocks anything: "
+            + ", ".join(f"<code>{escape(v)}</code>" for v in vendors) + ". "
+            + ("Google Web Risk — the list Chrome, Safari and Firefox actually "
+               "consume — does not list it. " if clean else "")
+            + ("Feeds this tool has traced: " + ", ".join(named) + ". "
+               if named else "")
+            + ("Not recognised, so their reach is unknown rather than harmless: "
+               + ", ".join(unknown) + "." if unknown else ""))
+    return Finding(
+        "REP-03", "low", "Reputation and blocklists",
+        f"{ratio} flag this host, none of them consequential",
+        what,
+        "This is recorded so it can be dismissed with evidence rather than "
+        "argued about. These feeds infer from domain age, the registrar, a shared "
+        "hosting IP, a neighbour in the same address range or a page template "
+        "that resembles one used for phishing; they publish no evidence and "
+        "several never retract. A count of them is not a measurement — the "
+        "denominator is how many feeds VirusTotal polls this month. It is still "
+        "worth a note in the file for two reasons: some payment processors, ad "
+        "networks and procurement checks read the VirusTotal aggregate without "
+        "reading which vendors it came from, and a prospect who searches the "
+        "domain can land on that page.",
+        "No emergency action. Confirm the site is clean against the "
+        f"authoritative sources — <a href=\"{rep_mod.SB_STATUS}\" "
+        "target=\"_blank\" rel=\"noopener\">Safe Browsing site status</a> and "
+        "Search Console's <em>Security Issues</em> — then, if a client or a "
+        "processor has raised it, file a false-positive report with each vendor "
+        f"individually (<a href=\"{rep_mod.VT_FP_DOC}\" target=\"_blank\" "
+        "rel=\"noopener\">VirusTotal cannot clear these; the vendor owns the "
+        "verdict</a>): " + _rep_review(rows) + ". Re-check before quoting the "
+        "aggregate to anyone, because these lists change without the site "
+        "changing.",
+        _rep_hits(rep, rows),
+        evidence=_rep_evidence(rep))
+
+
+# =====================================================================
+# Email authentication
+#
+# Records the domain publishes about itself, so unlike everything in the
+# reputation section these are facts rather than opinions, and every fix is one
+# DNS change entirely within the owner's control.
+#
+# The rule that matters here is the same one `reputation.py` lives by: a record
+# that could not be read is not a record that is absent. `mailauth.run` gates
+# every lookup on a control that always answers, and `ctx.mailauth` is empty
+# when that control failed — so every check below returns None rather than
+# reporting a domain with no SPF because a resolver was unreachable.
+# =====================================================================
+
+def _mail(ctx: Ctx) -> dict:
+    """The mail records, or {} when they could not be read."""
+    mail = ctx.mailauth or {}
+    return {} if mail.get("control_ok") is False else mail
+
+
+def _mail_hit(ctx: Ctx, record: dict, detail: str) -> list[Hit]:
+    """One hit, naming the DNS query that produced the answer.
+
+    The hit's URL is the site, because that is what the reader is auditing; the
+    lookup itself goes in the detail, so the finding can be verified with `dig`
+    without reading this file.
+    """
+    host = (ctx.cfg.host or "").removeprefix("www.")
+    lookup = record.get("endpoint") or f"DNS TXT {host}"
+    return [Hit(f"https://{host}/", f"{detail} · <code>{escape(lookup)}</code>")]
+
+
+@check
+def spf_missing(ctx: Ctx):
+    spf = _mail(ctx).get("spf") or {}
+    if spf.get("present") is not False:
+        return None
+    return Finding(
+        "MAIL-01", "high", "Email authentication",
+        "No SPF record — any server may send as this domain",
+        "The domain publishes no <code>v=spf1</code> TXT record, so nothing "
+        "states which servers are allowed to send mail as it.",
+        "Receivers weigh an unauthenticated domain far more harshly than a "
+        "small volume of complaints, so this is the usual reason a site's quote "
+        "confirmations and password resets land in spam while the site itself "
+        "looks fine. It also leaves the domain trivially spoofable: without SPF "
+        "there is nothing for DMARC to check.",
+        "Publish one TXT record at the domain root listing every service that "
+        "sends as it — the mail host, plus each application that sends "
+        "transactional mail (CRM, quote form, invoicing). Start "
+        "<code>v=spf1 include:&lt;provider&gt; ~all</code>, confirm nothing "
+        "legitimate fails, then tighten the last mechanism to <code>-all</code>.",
+        _mail_hit(ctx, spf, "no v=spf1 record published"))
+
+
+@check
+def spf_duplicated(ctx: Ctx):
+    spf = _mail(ctx).get("spf") or {}
+    if not spf.get("present") or spf.get("count", 1) <= 1:
+        return None
+    return Finding(
+        "MAIL-02", "high", "Email authentication",
+        f"{spf['count']} SPF records — a permanent error, so SPF fails",
+        f"The domain publishes {spf['count']} separate <code>v=spf1</code> "
+        "records. RFC 7208 §4.5 allows exactly one.",
+        "This is worse than having no SPF at all, because it looks configured. "
+        "A receiver that finds two records stops evaluating and returns "
+        "<code>permerror</code>, so SPF neither passes nor fails — it simply "
+        "does not apply, and any DMARC policy leaning on it stops working too.",
+        "Merge them into a single record, combining their "
+        "<code>include:</code> and <code>ip4:</code> mechanisms and keeping one "
+        "final <code>all</code> mechanism. Two records usually means two teams "
+        "each added one; check the total lookup count after merging.",
+        _mail_hit(ctx, spf, f"{spf['count']} v=spf1 records on one domain"))
+
+
+@check
+def spf_over_budget(ctx: Ctx):
+    spf = _mail(ctx).get("spf") or {}
+    if not spf.get("over_limit"):
+        return None
+    return Finding(
+        "MAIL-03", "high", "Email authentication",
+        f"SPF needs {spf['lookups']} DNS lookups — over the limit of "
+        f"{spf.get('lookup_limit', 10)}",
+        f"Evaluating this record costs {spf['lookups']} DNS-querying "
+        f"mechanisms. RFC 7208 §4.6.4 caps it at "
+        f"{spf.get('lookup_limit', 10)}."
+        + (" " + "; ".join(spf.get("lookup_notes") or [])
+           if spf.get("lookup_notes") else ""),
+        "Past the cap a receiver returns <code>permerror</code> and SPF does "
+        "not pass. The record is present and inert, which is the hardest "
+        "version of this fault to notice: mail authenticates for some receivers "
+        "and not others depending on how they count, and nothing in the record "
+        "looks wrong.",
+        "Remove <code>include:</code> entries for services no longer used — "
+        "this count grows every time a tool is added and never shrinks when one "
+        "is dropped. Where a provider publishes fixed ranges, replace its "
+        "<code>include:</code> with the <code>ip4:</code>/<code>ip6:</code> "
+        "entries, which cost no lookups.",
+        _mail_hit(ctx, spf, f"{spf['lookups']} of "
+                            f"{spf.get('lookup_limit', 10)} lookups used"))
+
+
+@check
+def spf_soft_fail(ctx: Ctx):
+    spf = _mail(ctx).get("spf") or {}
+    qual = spf.get("all_qualifier")
+    if not spf.get("present") or qual not in ("~", "?", "+", ""):
+        return None
+    sev = "medium" if qual in ("+", "?", "") else "low"
+    return Finding(
+        "MAIL-10", sev, "Email authentication",
+        f"SPF ends in {qual or 'no '}all, not a hard fail",
+        f"The record ends <code>{qual}all</code> — "
+        f"{escape(spf.get('all_meaning', 'no final all mechanism'))}."
+        + (" It also carries <code>+a</code>/<code>+mx</code>, which authorises "
+           "whatever the domain's own A and MX records point at."
+           if spf.get("broad") else ""),
+        "A soft fail tells receivers to accept unauthorised mail and merely "
+        "mark it, which is the correct setting while a record is being rolled "
+        "out and the wrong one to leave in place — it is the state most "
+        "spoofable domains are in. A <code>+all</code> or a missing "
+        "<code>all</code> authorises the whole internet.",
+        "Once the record lists every legitimate sender, change the last "
+        "mechanism to <code>-all</code>. Read the DMARC aggregate reports first "
+        "to confirm nothing legitimate is still failing; on shared hosting, "
+        "drop <code>+a</code>/<code>+mx</code> too, since they cover every "
+        "other site on the machine.",
+        _mail_hit(ctx, spf, f"ends {qual}all"))
+
+
+@check
+def dkim_missing(ctx: Ctx):
+    dkim = _mail(ctx).get("dkim") or {}
+    if dkim.get("present") is not False:
+        return None
+    return Finding(
+        "MAIL-04", "medium", "Email authentication",
+        "No DKIM key on any conventional selector",
+        f"None of the {len(dkim.get('probed') or [])} conventional selector "
+        "names published a key. DKIM selectors cannot be enumerated from "
+        "outside — only the receiver of a signed message learns one — so a "
+        "domain signing under a private selector will show here as none found.",
+        "DKIM is the only one of the three authentication methods that survives "
+        "forwarding and mailing lists, because it signs the message rather than "
+        "describing the sending server. Without it, DMARC has only SPF "
+        "alignment to work with, so enforcing a policy breaks legitimate "
+        "forwarded mail and the policy usually gets rolled back.",
+        "Turn on DKIM signing at the mail provider and publish the public key "
+        "it gives you at <code>&lt;selector&gt;._domainkey</code>. Do this for "
+        "every service that sends as the domain, not just the mailbox host.",
+        _mail_hit(ctx, dkim, "no key found on the conventional selectors"))
+
+
+@check
+def dkim_weak(ctx: Ctx):
+    dkim = _mail(ctx).get("dkim") or {}
+    weak = dkim.get("weak") or []
+    if not weak:
+        return None
+    return Finding(
+        "MAIL-05", "low", "Email authentication",
+        f"{len(weak)} DKIM selector{'s' if len(weak) != 1 else ''} appear to "
+        "use a 1024-bit key",
+        "Estimated from the published key's length rather than parsed: "
+        + ", ".join(f"<code>{escape(w['selector'])}</code> ≈{w['bits']}-bit"
+                    for w in weak) + ".",
+        "1024-bit RSA is below what large receivers now expect, and some have "
+        "begun treating signatures from short keys as unsigned. The failure is "
+        "silent — mail is simply weighted as if DKIM were absent.",
+        "Generate a 2048-bit key at the provider, publish it on a new selector, "
+        "switch signing to it, then remove the old selector once no mail is "
+        "signed with it.",
+        _mail_hit(ctx, dkim, ", ".join(f"{w['selector']} ≈{w['bits']}-bit"
+                                       for w in weak)))
+
+
+@check
+def dmarc_missing(ctx: Ctx):
+    dmarc = _mail(ctx).get("dmarc") or {}
+    if dmarc.get("present") is not False:
+        return None
+    return Finding(
+        "MAIL-06", "medium", "Email authentication",
+        "No DMARC record — nothing says what to do with mail that fails",
+        "There is no <code>v=DMARC1</code> record at "
+        "<code>_dmarc</code>, so SPF and DKIM results are advisory: each "
+        "receiver decides for itself what a failure means.",
+        "Without DMARC nobody can tell you who is sending as your domain, and "
+        "there is no instruction to reject mail that fails authentication. For "
+        "a business that quotes by email this is the gap an invoice-redirection "
+        "or fake-quote message walks through, arriving from your own domain.",
+        "Publish <code>_dmarc</code> as <code>v=DMARC1; p=none; "
+        "rua=mailto:dmarc@yourdomain</code>. Read the aggregate reports for a "
+        "fortnight, fix whatever legitimate sender fails, then raise the policy "
+        "to <code>quarantine</code> and then <code>reject</code>.",
+        _mail_hit(ctx, dmarc, "no _dmarc record published"))
+
+
+@check
+def dmarc_not_enforced(ctx: Ctx):
+    dmarc = _mail(ctx).get("dmarc") or {}
+    if not dmarc.get("present"):
+        return None
+    policy = (dmarc.get("policy") or "").lower()
+    pct = str(dmarc.get("pct") or "100")
+    partial_pct = pct.isdigit() and int(pct) < 100
+    if policy == "reject" and not partial_pct:
+        return None
+    if policy == "quarantine" and not partial_pct:
+        sev, what = "low", ("The policy is <code>p=quarantine</code>: failing "
+                            "mail goes to spam rather than being rejected.")
+    elif policy == "none":
+        sev, what = "medium", (
+            "The policy is <code>p=none</code>: receivers are asked to report "
+            "on mail that fails authentication, and not to quarantine or "
+            "reject it. Nothing about a spoofed message is blocked by this "
+            "record &mdash; what happens to one is decided by each receiver's "
+            "own filtering.")
+    else:
+        shown = escape(policy) or "(not given)"
+        sev, what = "medium", (f"The policy is <code>p={shown}</code>"
+                               + (f" applied to {escape(pct)}% of mail"
+                                  if partial_pct else "") + ".")
+    return Finding(
+        "MAIL-08", sev, "Email authentication",
+        f"DMARC is not enforcing (p={policy or 'none given'}"
+        + (f", pct={pct}" if partial_pct else "") + ")",
+        what + " The record itself is present and correctly formed.",
+        "<code>p=none</code> requests monitoring rather than enforcement: it "
+        "asks receivers to report on mail that fails authentication, but not to "
+        "quarantine or reject it. What actually happens to a spoofed message is "
+        "then left to each receiver's own anti-abuse systems, which is not "
+        "nothing but is not under your control and is not consistent between "
+        "them. An enforcing policy is what removes that discretion. This is the "
+        "setting a rollout starts at and where most domains are still sitting "
+        "years later — the record gets installed, the reports are never read, "
+        "and the policy is never raised.",
+        "Read the aggregate reports until every legitimate sender passes — that "
+        "is the whole of the work — then move to <code>p=quarantine</code>, "
+        "then <code>p=reject</code>, leaving <code>pct=100</code>. Raising the "
+        "policy is a one-line change; the fortnight of reading reports first is "
+        "what stops it bouncing your own mail.",
+        _mail_hit(ctx, dmarc, f"p={policy or 'not given'}"
+                              + (f", pct={pct}" if partial_pct else "")))
+
+
+@check
+def dmarc_no_reporting(ctx: Ctx):
+    dmarc = _mail(ctx).get("dmarc") or {}
+    if not dmarc.get("present") or dmarc.get("rua"):
+        return None
+    return Finding(
+        "MAIL-09", "low", "Email authentication",
+        "DMARC publishes no rua= address, so nobody receives the reports",
+        "The record has no aggregate-report address, so the daily XML reports "
+        "receivers generate are not sent anywhere.",
+        "A <code>p=none</code> record with no <code>rua=</code> is not doing "
+        "the one job <code>p=none</code> exists for. The reports are how you "
+        "discover which services send as your domain — usually two or three "
+        "nobody remembered — and without them the policy can never safely be "
+        "raised, so the domain stays unprotected indefinitely.",
+        "Add <code>rua=mailto:dmarc@yourdomain</code> to the record. Point it "
+        "at a mailbox or a reporting service; the raw XML is unreadable by hand "
+        "and free parsers exist.",
+        _mail_hit(ctx, dmarc, "no rua= address in the DMARC record"))
+
+
+@check
+def mx_missing(ctx: Ctx):
+    mx = _mail(ctx).get("mx") or {}
+    if mx.get("present") is not False:
+        return None
+    # A null MX (RFC 7505, `0 .`) is a deliberate statement that the domain
+    # accepts no mail, not an omission. Reporting it as a missing record tells
+    # the owner to undo a decision they made on purpose.
+    if mx.get("null_mx"):
+        return None
+    return Finding(
+        "MAIL-07", "medium", "Email authentication",
+        "No MX record — this domain cannot receive mail",
+        "There are no MX records, so no server is nominated to accept mail for "
+        "the domain.",
+        "Replies, bounces and the confirmation codes the site's own forms send "
+        "all fail. It also weakens the domain as a sender: receivers treat a "
+        "domain that cannot accept mail as a weaker correspondent, and bounce "
+        "handling is impossible, so a bad address list can never be cleaned.",
+        "Publish MX records pointing at your mail host. If mail for this domain "
+        "is handled elsewhere on purpose, that is what the MX records should "
+        "say — an absent MX is not the way to express it.",
+        _mail_hit(ctx, mx, "no MX records published"))
 
 
 # =====================================================================

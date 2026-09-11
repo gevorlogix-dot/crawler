@@ -17,6 +17,15 @@ before changing anything visual.
 
 ## 0. The audit tool (any site)
 
+**Restart `server.py` after changing anything under `audit/`.** It runs without
+Flask's reloader, so a process started before an edit keeps the old modules in
+memory and every audit it serves uses the old code — silently. That produced a
+report with no reputation and no mail sections, timestamped two minutes *after*
+those stages shipped, and there was nothing in the report to say why. Use
+`python server.py --debug` while developing, or re-run from the CLI: `/report/
+<domain>` reads `artifacts/audits/<domain>/report.html` off disk, so a CLI
+re-audit fixes an already-open report URL without touching the server.
+
 ```bash
 python server.py                       # http://127.0.0.1:5000 — paste a URL
 python scripts/audit_site.py example.com --open
@@ -27,6 +36,12 @@ python scripts/audit_site.py example.com --image-max-kb 120 --shots 20
 python scripts/audit_site.py example.com --no-retina   # skip the 2x srcset HEADs
 python scripts/audit_site.py example.com --no-images --no-shots   # fastest
 python scripts/audit_site.py example.com --perf-profile desktop   # faster vitals
+python scripts/audit_site.py example.com --no-reputation          # skip blocklists
+python scripts/audit_site.py example.com --reputation-feeds       # + URLhaus, Phishing Army
+
+# the blocklist lookup needs no key. these two only add breadth on top:
+setx WEB_RISK_API_KEY <key>    # Google Web Risk — licensed, documented, 100k/mo free
+setx VT_API_KEY <key>          # VirusTotal — the 89-vendor aggregate (non-commercial)
 python scripts/score_calibration.py    # are the score's windows still calibrated?
 python scripts/build_schema_vocab.py   # refresh the bundled schema.org vocabulary
 
@@ -38,10 +53,12 @@ curl localhost:5000/api/score/<domain>             # every metric, target and fi
 
 Pipeline, in `audit/`: `fetch` (sitemap → link-crawl fallback) → `extract`
 (per-page SEO + copy signals, plus `schema_validate`) → `graph` (orphans, click
-depth) → `probe` (robots.txt, exposed files, CMS endpoints) → `runtime` (Chromium
-sweep, plus a throttled `vitals` pass) → `media` (image weight) → `checks` (the
-rule engine) → `shots` (screenshots of what the checks found) → `score` (two
-numbers out of 100) → `report` (HTML).
+depth) → `probe` (robots.txt, exposed files, CMS endpoints) → `reputation`
+(third-party blocklists) + `mailauth` (SPF/DKIM/DMARC), both alongside the
+probes → `runtime` (Chromium sweep, plus
+a throttled `vitals` pass) → `media` (image weight) → `checks` (the rule engine)
+→ `shots` (screenshots of what the checks found) → `score` (two numbers out of
+100) → `report` (HTML).
 
 Three stages produce evidence rather than just numbers, and each is capped
 because its cost scales with how broken the site is, not with its size:
@@ -51,6 +68,8 @@ because its cost scales with how broken the site is, not with its size:
 | `schema_validate.py` | JSON-LD / Microdata / RDFa resolved against the real schema.org vocabulary, in two layers (schema.org validity · Google rich-result eligibility) | 80 issues per page, 25 of them "recommended" |
 | `media.py` | transferred weight of every `<img>`, at the `srcset` candidate a 1440px/1× desktop is served (`srcset.py`), plus the 2× rendition and embedded previews of the offenders | `image_limit` 600 images, `image_variant_limit` 300 retina HEADs, 24 previews |
 | `shots.py` | a labelled screenshot of each finding, in place on the page | `shot_limit` 12 shots, 3 per finding, 10 page loads |
+| `mailauth.py` | the domain's own SPF, DKIM, DMARC and MX records, over DNS-over-HTTPS — including SPF's RFC 7208 lookup budget, resolved recursively | ~30 DNS lookups, cached per run; `SPF_QUERY_CAP` 30, depth 6 |
+| `reputation.py` | what third-party blocklists already say about the host, ranked by what a listing does to a visitor (browser interstitial · web filter · mail · antivirus · feed) | 2 lookups per source, 1 control per source; no API key needed |
 
 **Adding a check** — one function in `audit/checks.py`, decorated with `@check`,
 returning a `Finding` or `None`. Every Finding must carry `why` and `fix` prose
@@ -62,6 +81,19 @@ Rules that matter:
 - **Orphan/reachability checks are suppressed when `ctx.truncated` is true.** If
   the page cap stopped the crawl short, the link graph is only a sample and every
   "orphan" it reports is an artefact. The report says so instead of guessing.
+- **An absent checkbox is not a decision** (`server._opt`, `FORM_REV`,
+  `OPT_INTRODUCED`). An unchecked box sends nothing — and so does a box that was
+  never rendered: a browser holding a cached copy of the page, a Re-run button
+  posted from an older session, anything scripted against the form before the
+  option existed. Reading both as "off" turns a newly-added stage off for
+  exactly the people who do not know it exists, and the report then comes out
+  missing a whole section with nothing in it to explain the gap. `form_rev`
+  separates the two: a form older than the revision that introduced an option
+  never offered it, so its silence takes the default; from that revision on,
+  silence is a real "off". Bump `FORM_REV` and add an `OPT_INTRODUCED` entry
+  whenever an option is added, and keep the Re-run hidden fields carrying the
+  current revision — without it they look like a stale page and get defaults
+  instead of "every stage on".
 - **One report per domain**, at `artifacts/audits/<domain>/`. Re-auditing replaces
   it, so a site's report URL is stable and always current.
 - **Severity is never colour alone** — every severity is a swatch plus its word.
@@ -245,10 +277,11 @@ The rules that make the number defensible, and which are easy to quietly break:
   metric is not an SEO score. Each category is still judged on its own evidence:
   a host that blocks `requests` while serving Chromium is real (Cloudflare bot
   management does exactly that), and those lab metrics are worth keeping.
-- **Gates cap the total** for faults no average can express: a production site
-  mostly `noindex` (cap 25), robots.txt blocking search (30), a homepage that does
-  not return 200 (45), no HTTPS (60). Each prints its reason and its fix, and the
-  raw pre-cap score is shown.
+- **Gates cap the total** for faults no average can express: a browser-level
+  blocklist listing (cap 20 — see `REP-01`), a production site mostly `noindex`
+  (25), robots.txt blocking search (30), a homepage that does not return 200
+  (45), no HTTPS (60). Each prints its reason and its fix, and the raw pre-cap
+  score is shown.
 - **`robots.txt` grouping is parsed, not regex-matched.** A bare
   `^Disallow: /$` search fires on the Cloudflare-managed block that most sites now
   carry — dozens of AI crawlers each with their own `Disallow: /` — and then caps
@@ -265,7 +298,7 @@ The rules that make the number defensible, and which are easy to quietly break:
 
 ### Tests for the engine (`tests/unit/`, marker `unit`)
 
-`python -m pytest -m unit` — 413 tests, no browser and no network. The root
+`python -m pytest -m unit` — 733 tests, no browser and no network. The root
 `conftest.py` has an autouse `_page_defaults(page)` fixture that would launch
 Chromium for anything under `tests/`, so `tests/unit/conftest.py` overrides it
 with a no-op; a fixture from the nearest conftest wins. What is pinned:
@@ -322,6 +355,53 @@ it prevents:
   `unknown_words` being dead data, and a `NameError` nothing carried out of the
   run. The other 40 tests are precision, one per measured false-positive class,
   with the recall cost of the near-miss gate pinned beside them.
+- `test_reputation.py` — the two directions the vendor count is wrong in, one
+  test each: four heuristic feeds must be **low** with no gate, and one Google
+  listing must be **critical** with the gate, out of the same 89. Plus the tier
+  map against spelling drift, `suspicious` staying out of the grading, a 404 /
+  401 / 429 from the third party staying out of the findings, the apex strip
+  refusing to produce a registry suffix, and the report's three-state
+  measurement line — rendered, with its gate's citation of `REP-01` checked
+  against the anchors actually in the document.
+- `test_reputation_sources.py` — the keyless sources, and the two traps their
+  controls caught. `127.0.0.1` from URIBL is a refusal and must not read as a
+  listing; a list whose own test point does not come back listed reports as
+  unread and answers neither way. Plus every vendor's documented return codes
+  one by one, the Safe Browsing decoder against both verbatim live responses
+  and five malformed ones, the resolver check needing a difference rather than
+  a sentinel, exact-only feed matching, and the cache preferring a stale copy
+  to no source at all. The provenance section is pinned in
+  `test_reputation.py`: it renders on a run with no findings at all, it names
+  every endpoint and control, a stood-down source is not shown as having
+  answered, no escaped entity leaks into the markup, and every chip carries
+  its word. The score is pinned band by band, plus the invariant the whole
+  design rests on — `overall` and `raw` unchanged across a clean run, a
+  gateway listing and an endpoint listing, with only the browser-level gate
+  moving the total.
+- `test_server_options.py` — the web UI's toggles. A form that predates an
+  option gets the default; a current form means what it says; a junk
+  `form_rev` falls to the safe side; the Re-run fields carry the revision;
+  and the feeds toggle stays off at every revision, because it is opt-in on
+  purpose.
+- `test_mailauth.py` — the records, the two scores and the ten findings.
+  The scoring audit added a table-driven pass over the things that are easy
+  to get subtly wrong and expensive to notice: every DNS rcode
+  (SERVFAIL/REFUSED unreadable, NXDOMAIN authoritative), the `all` token
+  against five hostnames that contain the letters, a policy inherited
+  through `redirect=`, a repeated `include:` costing two, a `redirect=`
+  costing nothing behind an `all`, `p=none|quarantine|reject` × `pct`, an
+  undiscoverable DKIM key scoring `None` rather than 0, a permerror
+  record's qualifier, a null MX, and the three blocklist states end to end
+  through the score — including a clean verdict backed by a control that
+  fired. The
+  guard that matters is `test_nothing_fires_when_the_records_could_not_be_read`:
+  the false positive it prevents is "No SPF record — any server may send as
+  this domain", high severity, about a domain whose resolver was unreachable.
+  Then the real records of two live domains pinned verbatim, the SPF lookup
+  budget including a loop and a dead `include:`, a revoked DKIM selector, a
+  `pct` below 100, the spam/phishing split (one listing never charged twice),
+  a row dropped when its tier never answered, and that no title carries
+  markup.
 - `test_false_positives.py` — the crawler's own trailing slash, the framework
   catch-all read as a WordPress route, the hostname guess that capped a QA host
   at 25/100, the `aria-hidden` controls counted as unlabelled, and the WAF
@@ -623,6 +703,422 @@ reporting our own access and swinging 45↔90 on a site nobody had touched.
   `--max-pages` when the host is the one saying no.
 - **A refused homepage produces no gate.** The score is withheld outright
   instead; capping at 45 published a number about a site nobody had looked at.
+
+### A vendor count is not a finding (`audit/reputation.py`, `REP-01`…`REP-03`)
+
+The third instance of the same rule, after `probe.py`'s "a 200 is not a finding"
+and `fetch.refusal`'s "a refusal is not a finding": **"4 of 89 security vendors
+flagged this domain as malicious" is a number with no usable denominator, and
+printing it as written would be the tool reporting somebody else's heuristics as
+a defect of the site.** VirusTotal is an aggregator, not an authority — it polls
+~90 blocklists and adds up the answers. Most are automated feeds that never
+opened the page: they infer from domain age, the registrar, a shared hosting IP,
+a neighbour in the same /24, or a template that resembles one used for phishing.
+They publish no evidence and several never retract. The denominator is how many
+feeds VirusTotal polls *this month*, which moves without the site changing. So
+**4/89 from four feeds is noise and 1/89 from Google is a site that has stopped
+receiving traffic**, and no ratio can tell those apart.
+
+- **The ranking is by consequence, never by count and never by accuracy.**
+  `VENDOR_CONSEQUENCE` maps each vendor onto the mechanism a listing actually
+  triggers, and `TIERS` prints that mechanism in the finding: `browser` (a
+  full-page warning in Chrome/Safari/Firefox before the page loads), `gateway`
+  (a block page on the corporate and ISP web filters these vendors sell),
+  `mail` (transactional mail rejected or filed as spam), `endpoint` (antivirus
+  on the visitor's own machine), `feed`, `unknown`. That is a claim about
+  plumbing, which is checkable. "Vendor X is more accurate than vendor Y" is not,
+  and the tool never makes it.
+- **A vendor missing from the map grades `unknown`, not harmless and not
+  severe** — the failure mode of a stale map has to be under-claiming. But
+  `unknown` is a *separate* bucket from `feed`: the report may only call a flag
+  "a heuristic feed" about a feed in `KNOWN_FEEDS`; about anything else the
+  honest sentence is "no consumer we can name". And because the map is keyed on
+  VirusTotal's own spelling, `_rep_evidence` prints **every** flagging vendor
+  with its tier, including the ones graded as noise — otherwise a renamed
+  browser-level vendor would silently stop being critical with nothing in the
+  report to show it.
+- **Severity is the worst tier present, then corroboration.** `browser` is
+  critical on its own, because it is not a vote — it is already happening to
+  visitors. `gateway`/`mail` is high at two vendors and **medium at one**, since
+  these are automated content categorisers that mislabel lead-generation and
+  local-service sites routinely. `endpoint` is medium at two, low at one. Feeds
+  are low, and `REP-03` exists so the flag can be *dismissed with evidence*
+  rather than argued about: it names every vendor, prints the negative from Web
+  Risk beside them, and says what actually happens next.
+- **`suspicious` is not `malicious`.** VirusTotal's own headline counts
+  `malicious` only, so grading does too; `suspicious` rows are recorded and
+  printed in the evidence. Folding the two together is how a 0/89 site acquires
+  a finding.
+- **It is not a scored metric, and it is a gate.** Every SEO metric is a ratio
+  over this site's own pages put through a calibrated window; a third party's
+  opinion is neither a ratio nor a property of the pages, and "4 of 89" cannot be
+  compared between two runs of the same unchanged site. A `browser`-tier listing
+  is a **gate capping the total at 20** instead — the hardest cap in the model,
+  below the mostly-noindex 25, because noindex only removes a site from search
+  while an interstitial also turns away the people who typed the domain in. Only
+  `browser` fires it; never a count, never a lone web filter.
+- **Never asked is not clean.** `Ctx.reputation` empty means not measured, so all
+  three checks key off the listings themselves. `web_risk_clean` is recorded even
+  when `True`, because an empty `{}` from the one list browsers consume is the
+  most useful line in the file — it is what turns an alarming VirusTotal ratio
+  into a non-event. The report's measurement callout therefore has **three**
+  states, not two: `N blocklist lookups`, `blocklist lookup not completed
+  (<reason>)`, `no blocklist lookup (no reputation API key configured)`. Saying
+  "1 blocklist lookup" about a 401 reads as a clean bill for a host nobody got an
+  answer about.
+- **Read-only, and off without a key.** `GET /api/v3/domains/{d}` reads a record
+  that already exists; VirusTotal's *submission* endpoints publish the URL to
+  anyone with an account, so nothing here ever POSTs. Configuring a key is the
+  opt-in, because the lookup tells a third party which host is being audited.
+- **No API key is required, and the keyless sources are the default.** Six of
+  them, all measured working from an ordinary connection, all inside the ~4s the
+  stage costs — and that 4s hides inside the probe window, so the run does not
+  get longer:
+
+  | Source | Answers | Tier | Key |
+  |---|---|---|---|
+  | Safe Browsing, via the Transparency Report's JSON | will Chrome/Safari/Firefox warn | `browser` | no |
+  | Cloudflare `1.1.1.2` security resolver, over DoH JSON | is DNS-level malware filtering blocking it | `gateway` | no |
+  | Spamhaus DBL · SURBL · URIBL, over plain DNS | is the domain on a **spam/phishing** blocklist | `mail` | no |
+  | URLhaus · Phishing Army (`--reputation-feeds`, cached 12h) | has a URL here been seen serving malware or phishing | `gateway`/`feed` | no |
+  | Google Web Risk `uris.search` | row 1's answer, documented and licensed | `browser` | yes |
+  | VirusTotal `/domains/{d}` | the 89-vendor aggregate and its categories | varies | yes |
+
+  The keyed rows are an upgrade, not a requirement. Web Risk is the documented,
+  commercially-licensed form of row 1 (100,000 lookups a month free); the
+  VirusTotal free key is **4 requests a minute and non-commercial only**, which
+  is why nothing spends more than two lookups on it per run. A rate limit, a
+  rejected key or a slow third party is recorded in `unavailable` and costs no
+  points: it is not a fact about the site.
+- **Every keyless source carries a control, queried on the same run through the
+  same path**, and a source whose control does not come back listed contributes
+  nothing and is reported as *not readable from this network* — never as "not
+  listed". That is not defensive programming; it is the only thing that makes
+  these sources safe to use, and **two of them were caught by it**:
+  - **URIBL answers a refused query with `127.0.0.1`** — an A record. "Query
+    blocked, possibly due to high volume", per their own documentation. A check
+    that reads any answer as a listing reports `example.com` as blocklisted,
+    which is what the first draft did. Its control (`test.uribl.com`, which must
+    answer `127.0.0.14`) fires on a working connection and returns `127.0.0.1`
+    on a blocked one, which is exactly how the two are told apart.
+  - **Spamhaus DBL answered its own always-listed test point (`dbltest.com`)
+    with NXDOMAIN** on one run and correctly on the next — public resolvers are
+    refused intermittently. NXDOMAIN is byte-identical to "not listed", so
+    without a per-run control the report publishes a clean bill for a list it
+    never read. It is per-run for exactly that reason: the answer changed
+    between two runs minutes apart.
+
+  Return codes are each vendor's own documented ones, never a "we got an answer"
+  test: Spamhaus `127.0.1.2-99` listed and `102-199` advisory (reported, and
+  labelled "abused but not inherently malicious"), SURBL bitmasked with
+  `127.0.0.1` meaning blocked, URIBL `127.0.0.2/4/8` listed with `127.0.0.1`
+  and `.255` blocked.
+- **The Safe Browsing route is an undocumented endpoint, and is treated as one.**
+  It is the Transparency Report's own JSON, which is the only way to read the
+  verdict that matters without a key. So the response is checked field by field,
+  the host it answered for must match the host asked about, an unknown status
+  code decodes to `None` rather than to a guess, and the control has to fire
+  first — when it eventually changes, the stage goes quiet rather than wrong.
+  **The control is checked once per run, not once per host**: it returned
+  HTTP 429 during development at four calls per run, and a rate limit that loses
+  the source entirely is worse than a second hostname going unmeasured.
+- **A resolver block needs a difference, not a sentinel.** Cloudflare's security
+  resolver answers a blocked host with `0.0.0.0` — and so it does a host with no
+  address anywhere, which is an ordinary dead subdomain and not a reputation
+  signal. Only a disagreement between `1.1.1.2` and `1.1.1.1` counts as a block.
+- **Feed matching is exact, never a parent domain.** "Something under
+  `wordpress.com` is on URLhaus" is not a statement about this site, and a suffix
+  match on a shared host turns one compromised customer into a finding against
+  every other one. A URL-feed hit quotes the **URL**, because that names the file
+  to delete; "this domain is on URLhaus" is not actionable. Feeds are opt-in for
+  two reasons — each is a multi-megabyte download (cached 12 hours, and a stale
+  copy is preferred to losing the source), and Phishing Army is **CC BY-NC**,
+  which a paid audit cannot lean on silently, so the licence travels with every
+  hit.
+- **Remediation is per tier, because the work is different.** A `mail` listing is
+  fixed in DNS and at the sender — SPF/DKIM/DMARC, then find the unprotected form
+  being used as a relay, then move transactional mail off shared hosting IPs, and
+  only then request delisting, because a removal requested while the cause is
+  still live is re-listed within days. A `gateway` listing is fixed by finding
+  what the categoriser reacted to and then asking it to look again. One fix
+  paragraph for both told the reader to dispute a listing they should have been
+  fixing.
+- **What came back clean is recorded too** (`reputation.clean`), and printed in
+  every finding's evidence. A reader dismissing a feed flag needs to see that the
+  consequential lists were actually asked and actually answered — and the
+  report's measurement line counts the sources *read* with the unreadable ones
+  beside them, because "6 sources read" on its own invites the assumption that
+  the seventh passed.
+- **There is a reputation score, it is shown in three places, and it is never
+  part of the overall** (`score.reputation_score`, `REPUTATION_BANDS`). It could
+  not be weighted in: every other number in the model is a ratio over this
+  site's own pages through a calibrated window, and a blocklist verdict is
+  neither a ratio nor a property of the pages — "4 of 89" has a denominator that
+  moves without the site changing. Fold it in at any weight and the overall
+  swings when a third party changes its mind about a site nobody touched, which
+  is the 45↔90 swing `ERR-14` exists to stop. The one case that *must* move the
+  total already does, as a gate: a browser-level listing caps the overall at 20.
+  So it is a **banded verdict rendered as a number**, and the band that produced
+  it is printed next to it:
+
+  | Worst listing | Vendors | Score | Why that number |
+  |---|---|---|---|
+  | browser | any | **0** | not a vote — visitors are already shown a warning instead of the site, so there is no partial credit |
+  | gateway / mail | 2+ | **35** | two independent vendors agree, which is a pattern rather than one categoriser's mistake |
+  | gateway / mail | 1 | **60** | a real consequence on weak evidence |
+  | endpoint | 2+ | **70** | antivirus warns on the visitor's own machine |
+  | endpoint | 1 | **85** | one antivirus vendor |
+  | feed / unknown | any | **92** | a note for the file, not a fault |
+  | nothing | — | **100** | no listing on any source that answered |
+
+  Rules that keep it honest: **no source answered means no number** (`None`, and
+  the report prints the reason where the number would go — same rule as
+  `Score.overall`, because a number nobody measured cannot be told from a clean
+  one); **an unreadable source costs no points**, only confidence, which is
+  `sources_read / (read + unread)` and is the same "dropped, not failed" rule the
+  rest of the model follows; and **a tier with no band scores as the mildest
+  listing, never as clean**, so a tier added later cannot read as a pass. It
+  appears in the masthead readout as `Reputation · unweighted`, as a score tile
+  labelled `Reputation · not in overall`, at the head of the `#reputation`
+  section with its meter and the full explanation, and in the CLI summary as
+  `unweighted`. `data.json` carries it under `reputation.score` with
+  `weighted_into_overall: false` stated in the file, so a consumer reading
+  `score.overall` and `reputation.score` side by side cannot add them up.
+  Pinned in `test_reputation.py`: every band, and that the overall and the raw
+  pre-gate score are byte-identical across a clean run, a gateway listing and an
+  endpoint listing.
+- **The report carries the provenance, and renders it on a clean run too**
+  (`report._reputation_section`, `#reputation`, in the "Jump to" rail). One row
+  per source with its verdict as a chip and the consequence of a listing there,
+  and under each row the line that makes the verdict checkable: the exact request
+  (`GET https://transparencyreport.google.com/…?site=<host>`, `DNS A
+  <host>.dbl.spamhaus.org`), what came back (`NXDOMAIN`, `1.1.1.2 →
+  172.67.147.49`, `no match among 114,910 entries`), which control cleared it and
+  what that control returned, the method in one sentence, and the feed's licence
+  where there is one. Then the tier table, so the absence of a listing means
+  something. It renders **whether or not a finding fired**: the reader's question
+  is "is my site flagged", and "no findings" is not visibly distinguishable from
+  "we never looked".
+  Three defects this section had on its first render, all of which misled:
+  - A literal `&mdash;` in the output, because an HTML entity was written inside
+    a string that then goes through `escape()`. Entities belong in the template;
+    escaped content takes the real character.
+  - "control … did not fire" printed beside a sound "not listed" verdict, on the
+    two sources whose control is checked once per run rather than once per host.
+    The control had fired; the per-host record simply did not carry it. `run()`
+    now stamps the run-level control's own answer onto each record it authorised.
+    A false alarm about the tool's own validation teaches the reader to distrust
+    the whole section.
+  - "answered &lt;the control's error&gt;" on a source that stood down. `dnsbl`
+    returns *before* querying the target when its control fails, so that line
+    described a measurement which never happened; it now reads "not asked — the
+    control failed first".
+  Verified by rendering, per section 7 rule 7: 360/414/768/1024/1440px in both
+  schemes, `scrollWidth - clientWidth == 0` at every one, the table scrolling
+  inside its own `.scroll` container at the two narrow widths, and all 13 chips
+  carrying their word. Class names are scoped (`.repsrc`, `.repprov`,
+  `.repunread`) for the reason rule 9 exists.
+- **The apex is queried, never guessed.** VirusTotal keeps separate records for
+  `www.example.com` and `example.com` and a listing commonly lands on only one,
+  so `lookup_hosts` strips a leading `www.` — and nothing more. Deriving a
+  registrable domain needs the Public Suffix List, and a guess turns
+  `sub.example.co.uk` into a lookup of `example.co.uk`, which is somebody else's
+  domain. `MULTI_LABEL_SUFFIXES` is the floor under that one strip so
+  `www.co.uk` cannot reduce to a registry suffix.
+- **Only dispute URLs that were verified to exist are printed** (`REVIEW_URLS`).
+  A fix that sends the reader to a dead URL costs them more than one that names
+  the vendor and stops. Verified: Search Console, `fortiguard.com/webfilter`,
+  `check.spamhaus.org`, BrightCloud at `support.threatintel.opentext.com`, and
+  VirusTotal's own false-positive guidance — which says to take a detection to
+  the vendor that produced it, because VirusTotal does not own the verdicts and
+  cannot remove them. A reader who writes to VirusTotal has lost the week.
+- **What is deliberately not done:** a per-URL sweep. The lookup covers the
+  origin, which is the case that shows an interstitial to everyone; a single
+  hacked URL on an otherwise clean host would need a call per page, and the
+  finding does not imply one was made.
+
+### Spam and phishing posture (`audit/mailauth.py`, `MAIL-01`…`MAIL-10`)
+
+The only signals in the audit that are neither a third party's opinion nor a
+property of the crawled pages: **records the domain publishes about itself**.
+That makes them the most checkable thing in the report and the only findings
+whose fix is entirely in the owner's hands — one DNS change each. All of it is
+TXT and MX over DNS-over-HTTPS, so no API key and no new dependency.
+
+- **A record that could not be read is not a record that is absent.** This is
+  the same rule `reputation.py` lives by and it is worse here, because the wrong
+  answer looks so definite: an unreachable resolver and a domain with no SPF are
+  byte-identical from outside, and one of them is a high-severity finding.
+  `mailauth.Resolver.check_control` asks for `_spf.google.com`, which publishes
+  an SPF record by definition; when that fails, `run()` returns with
+  `control_ok: False` and **no record verdicts at all**, and every `MAIL-*` check
+  returns `None` on it via `checks._mail`.
+- **Two scores, and the split is a split of concerns rather than a re-slicing of
+  the same facts.** `spam` is *deliverability* — will mail this domain sends be
+  delivered: SPF/DKIM/DMARC/MX existence, SPF's record count, SPF's lookup
+  budget, mail-blocklist status. `phishing` is *spoofing resistance* — can
+  somebody else send as this domain: DMARC's policy **strength** and reporting
+  address, SPF's final qualifier, a DKIM key being published,
+  phishing-list status. SPF and DMARC appear in both deliberately: their
+  existence is a deliverability fact, their strength is a spoofing fact, and
+  those have different fixes. For a site that is not itself malicious, being
+  impersonated *is* its phishing exposure, which is why `p=none` dominates that
+  score.
+- **`p=none` is a passing "DMARC record published" and a zero "DMARC policy
+  enforced".** Those are two different questions and the row names decide which
+  is being asked. A valid `v=DMARC1; p=none; …` record *is* published, so the
+  deliverability row passes; it requests no enforcement, so the spoofing row
+  scores 0. `p=none` used to score **0.15** on the enforcement row, which
+  credited the record's mere existence twice — the spam score already pays for
+  it — and made an unenforced domain read as partly protected.
+- **A row's weights must sum to its declared total** (`W_SPAM`, `W_PHISH`,
+  `POSTURE_WEIGHT`). Spam's rows summed to **110** against a declared 100, and
+  because `coverage` is `min(1.0, measured / declared)` the discrepancy was
+  invisible: a run with a row missing still reported 100% measured, which is the
+  one thing coverage exists to disclose. Both tables now sum to exactly 100 and
+  `test_the_declared_weight_matches_a_fully_populated_run` asserts it against a
+  fully-populated run, the same guard `DECLARED_WEIGHT` has.
+- **A sub-property of an absent record is not a second fault.** `spf_single` and
+  `spf_lookups` are properties *of* an SPF record and `dmarc_reporting` of a
+  DMARC record, so with no record they are not measurable — one missing record
+  is one fault, not three. The rows drop and coverage says so.
+- **`pct` blends, and never applies to `p=none`.** RFC 7489 §6.3 makes `pct` the
+  share of messages the *requested policy* applies to, so a partial rollout is
+  `share × policy` with the remainder unenforced — not the policy scaled by an
+  arbitrary floor, which is what it was. And with `p=none` there is no policy to
+  sample, so `pct` changes nothing; multiplying the `none` value by `pct/100`
+  was simply wrong. Pinned across `reject`/`quarantine`/`none` × `pct`.
+- **A DKIM key that cannot be found is undetermined, not absent.** DKIM
+  publishes no way to enumerate selectors — only the receiver of a signed
+  message learns one — so "none of the conventional names answered" cannot
+  distinguish a domain with no DKIM from one signing under a private selector.
+  It was scored as a hard **0**, charging 20 points for a fact the tool cannot
+  establish. Both DKIM rows now return `score=None` with a `note` naming how
+  many selectors were probed, so they drop and renormalise like every other
+  unmeasurable metric. A selector found but **revoked** (empty `p=`) is also
+  undetermined, for the same reason — another selector may be signing — and is
+  reported rather than scored.
+- **The rows name what is actually checked.** A key in DNS is not evidence that
+  live mail is signed, that a signature verifies, or that the signing domain
+  aligns with the visible From — all three need a received message. So the row
+  is "DKIM key published (required for DMARC alignment)", not "DKIM available
+  for DMARC alignment", and both posture descriptions carry `DNS_ONLY_NOTE`:
+  these are checks of published records, and live message authentication is not
+  observed here.
+- **A permerror record's qualifier is not scored as if it applied.** Two
+  `v=spf1` records means evaluation stops with `permerror`, so no qualifier from
+  either is in force; `spf.effective` records that and `spf_strict` scores 0
+  with the reason, instead of giving `~all` half credit for a policy that does
+  not apply.
+- **A null MX is neither a missing record nor a working one.** RFC 7505's `0 .`
+  is an explicit declaration that the domain accepts no mail: not a fault to fix
+  (so `MAIL-07` stands down) and not a mail route either (so the row scores 0.5
+  and says which it is). The first implementation stripped the trailing dot off
+  the whole record *before* splitting it, so `0 .` became `0` and the
+  preference number was read as the exchange — it never detected one.
+- **Both are weighted compliance checklists, not ratios, and both say so.**
+  Each row is pass / partial / fail against a published standard (RFC 7208,
+  7489, 6376) with **its weight printed** beside it, because a reader who cannot
+  see the weights cannot argue with the number. They are not put through the
+  calibrated windows in `WINDOWS` — that would be borrowing authority the
+  measurement does not have. Measured on two real domains: both score **spam
+  100/100** (every record present) and **phishing 60 and 50** — `p=none` costs
+  30 of 100, `~all` costs 10, and a missing `rua=` costs the second domain
+  another 10. That spread is the point; a single "reputation" number reported
+  both as clean.
+- **Neither is part of the overall**, same as the reputation score, and pinned
+  the same way: `overall` and `raw` byte-identical across a clean domain and one
+  left at `p=none`.
+- **A row whose tier never answered is dropped, not passed.** "No mail blocklist
+  listed it" and "no mail blocklist would talk to us" are the same sentence from
+  outside, and only one is good news — so `reputation.run` records
+  `tiers` (`{vendor: tier}`) for every source that *answered*, and
+  `score._tier_answered` gates the blocklist row on it. A run where all three
+  DNSBLs were refused renormalises without that row and discloses it in
+  coverage.
+- **One listing is never charged to two scores.** `_mail_listings` takes the
+  `mail` tier; `_phish_listings` takes vendors in `PHISH_VENDORS` or a verdict
+  whose text names phishing. A Spamhaus listing costs the spam score only; a
+  Phishtank listing costs the phishing score only. Both pinned.
+- **Only NOERROR and NXDOMAIN are an authoritative "no record".**
+  `Resolver.query` checked the HTTP status and never the DNS `Status` field, so
+  a **SERVFAIL** came back as a 200 with an empty answer list — byte-identical
+  to "this domain publishes no SPF". The module's own central rule, broken in
+  its own plumbing. `AUTHORITATIVE_RCODES` is `{0, 3}`; anything else falls
+  through to the second resolver and then to `None`, which every caller reads as
+  unreadable.
+- **The `all` mechanism is matched as a token, never as a substring.**
+  `re.search(r"([+\-~?]?)all\b")` matches inside other tokens, so
+  `exists:%{i}.all.example.com` and `include:all.spf.example.com` both reported
+  a bare `all` — the record's policy read off a hostname. `ALL_TOKEN` anchors
+  both ends. Same class of mistake as `MISSING_SPACE`'s three-letter minimum:
+  a pattern that is nearly right on the common case and silently wrong on the
+  real one.
+- **A policy inherited through `redirect=` is found and attributed.** RFC 7208
+  §6.1 uses the redirect target's record when no mechanism matches and there is
+  no `all`, so "no final `all` mechanism" about such a record described the
+  parser rather than the domain. `_all_qualifier` follows the modifier and
+  `all_from_redirect` names where the qualifier came from.
+- **SPF's lookup budget is resolved, not counted syntactically.** RFC 7208
+  §4.6.4 caps evaluation at 10 DNS-querying mechanisms, and exceeding it is a
+  `permerror` — SPF neither passes nor fails, so the record is present and inert,
+  which is the hardest version of this fault to notice. `_spf_lookup_cost`
+  follows `include:` and `redirect=` recursively (bounded by `SPF_QUERY_CAP` and
+  `SPF_DEPTH_CAP`), and counts bare `a`/`mx` as well as the `a:`/`mx:` forms —
+  inspecting the token rather than prefix-matching it, which is what a prefix
+  match gets wrong. Two corrections the first version needed:
+  - **The limit counts mechanisms evaluated, not distinct names.** A single
+    `seen` set shared across the whole traversal meant the same `include:`
+    reached down two branches was counted **once**, under-reporting every record
+    where two providers both include a third — the common shape. Loop detection
+    now uses the include chain (`path`), which is what it was really for and
+    does not hide a sibling's cost.
+  - **`redirect=` costs nothing when the record has an `all`.** Evaluation
+    terminates at `all` and never reaches the modifier (§6.1), so a receiver
+    never spends that lookup.
+- **`v=spf1` is the version token, not a prefix.** RFC 7208 §4.5 requires it to
+  be followed by a space or the end of the record, so a hypothetical
+  `v=spf1000 …` record no longer counts as an SPF record — which matters because
+  the count decides a permerror.
+- **A long TXT record is concatenated, never space-joined.** Over 255 bytes a
+  TXT record arrives as several quoted strings, and joining them with a space
+  breaks a DKIM key in the middle of its base64 — the key then reads as
+  malformed. Same class of mistake as `extract.block_text`'s `get_text(" ")`.
+- **An SPF record is found among the others, never taken as the first TXT
+  record.** One real domain publishes five `google-site-verification` records, a
+  Yahoo key and one `v=spf1` record; the pinned fixture is that exact list.
+  **Two `v=spf1` records is counted** because RFC 7208 §4.5 allows one and two is
+  a `permerror` — worse than none, since it looks configured.
+- **DKIM selectors cannot be enumerated**, so `DKIM_SELECTORS` probes the
+  conventional names and "none found" is a statement about the probe. The
+  finding says so in as many words rather than claiming there is no DKIM. An
+  empty `p=` is a **revoked** selector, reported separately from no DKIM at all,
+  because telling someone to set up what they deliberately turned off wastes
+  their afternoon. Key size is **estimated from the published key's length** and
+  labelled as an estimate everywhere it is printed.
+- **A DMARC policy applied to part of the mail is not enforcing.** `pct` is
+  routinely left at a rollout value, and `p=reject; pct=10` protects a tenth of
+  the mail; both the score and `MAIL-08` read it.
+- **Finding titles are plain prose.** `report._finding` renders the title through
+  `escape()` and the CLI prints it raw, so `<code>p=none</code>` in a title
+  printed as its own source text in both. Three of these titles shipped that way
+  and are pinned against it now.
+- **The `p=none` wording does not claim spoofed mail is delivered.** "anyone can
+  send as this domain and the mail is delivered" is an overstatement: `p=none`
+  requests monitoring rather than enforcement, and what happens to a message
+  that fails authentication is then decided by each receiver's own anti-abuse
+  filtering — not nothing, but not under the owner's control and not consistent
+  between receivers. An enforcing policy is what removes that discretion, and
+  that is what the prose now says. The phrase survived in `MAIL-08.what` after
+  `MAIL-08.why` was corrected, which is why the test asserts over **every**
+  field a reader sees — `what` is the first line printed, and it was the one
+  still wrong.
+- **`PostureScore.basis` is plain text, entities included.** It is read by a
+  JSON consumer as well as rendered in HTML, and `&minus;30` reached
+  `data.json` as its own source text. `_plain_text` unescapes as well as
+  stripping tags.
+- `data.json` carries `mail` — every record as published, the exact lookup that
+  read it, and both posture scores with `weighted_into_overall: false`.
 
 ### Orphans: three different faults, not one (`audit/graph.py`)
 

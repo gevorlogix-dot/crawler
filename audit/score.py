@@ -49,6 +49,7 @@ be traced back to the model that produced it.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from statistics import median
 
@@ -454,6 +455,666 @@ class Category:
                 "extra": self.extra}
 
 
+# --------------------------------------------------------------------------
+# Reputation
+#
+# Scored, shown, and **deliberately not weighted into the overall**.
+#
+# It cannot be weighted. Every other number in this model is a ratio over the
+# site's own pages put through a calibrated window; a blocklist verdict is
+# neither a ratio nor a property of the pages, and "4 of 89 vendors" has a
+# denominator that moves without the site changing. Fold it in at any weight and
+# the overall score swings when a third party changes its mind about a site
+# nobody touched — the 45↔90 swing `ERR-14` exists to stop. The one case that
+# *must* move the overall already does, as a gate: a browser-level listing caps
+# it at 20, because no average can express a site whose visitors are shown a
+# warning instead of the page.
+#
+# So this is a banded verdict rendered as a number for glanceability, and the
+# band that produced it is printed beside it. The bands are the same judgement
+# the findings make, in the same order: what a listing at that level does to a
+# visitor, and how many independent vendors agree.
+REPUTATION_BANDS: tuple[tuple[str, int, int, str], ...] = (
+    # (worst tier, minimum vendors agreeing, score, why this number)
+    ("browser", 1, 0,
+     "this is not a vote — visitors are already being shown a warning instead "
+     "of the site, so there is no partial credit for it"),
+    ("gateway", 2, 35,
+     "two independent web-filter vendors agree, which is a pattern rather than "
+     "one categoriser's mistake"),
+    ("gateway", 1, 60,
+     "one web-filter vendor, which is a real consequence on weak evidence — "
+     "these mislabel lead-generation and local-service sites routinely"),
+    ("mail", 2, 35,
+     "two independent mail blocklists agree, so transactional mail from this "
+     "domain is being rejected rather than delayed"),
+    ("mail", 1, 60,
+     "one mail blocklist, which costs deliverability on weak evidence"),
+    ("endpoint", 2, 70,
+     "two antivirus vendors warn on the visitor's own machine — narrower reach "
+     "than a browser listing, attached to the brand all the same"),
+    ("endpoint", 1, 85, "one antivirus vendor"),
+    ("feed", 1, 92,
+     "flagged only by aggregate feeds, which no product we can name consumes — "
+     "a note for the file, not a fault"),
+    ("unknown", 1, 92,
+     "flagged only by lists whose consumers we cannot name, so their reach is "
+     "unknown rather than harmless"),
+)
+
+CLEAN_REPUTATION = 100
+
+
+@dataclass
+class ReputationScore:
+    """The blocklist verdict as a number. Never part of `Score.overall`."""
+
+    # None when no source returned a usable answer. Same rule as the overall: a
+    # number that was not measured is worse than no number, because the reader
+    # cannot tell "clean" from "never asked".
+    score: int | None
+    basis: str
+    sources_read: int
+    sources_unread: int
+    listings: int = 0
+    worst_tier: str = ""
+    read: list[str] = field(default_factory=list)
+    unread: list[str] = field(default_factory=list)
+
+    @property
+    def grade(self) -> str:
+        return band(self.score)[0]
+
+    @property
+    def severity(self) -> str:
+        return band(self.score)[1]
+
+    @property
+    def coverage(self) -> float:
+        total = self.sources_read + self.sources_unread
+        return (self.sources_read / total) if total else 0.0
+
+    @property
+    def confidence(self) -> str:
+        """Sources answered, not points lost. An unread list never costs a
+        point — it is disclosed here instead, which is the same rule the rest of
+        the model follows for a stage that did not run."""
+        cov = self.coverage
+        return "high" if cov >= 0.85 else "medium" if cov >= 0.5 else "low"
+
+    def as_dict(self) -> dict:
+        return {"score": self.score, "grade": self.grade,
+                "band": self.severity, "basis": self.basis,
+                "weighted_into_overall": False,
+                "coverage": round(self.coverage, 3),
+                "confidence": self.confidence,
+                "sources_read": self.sources_read,
+                "sources_unread": self.sources_unread,
+                "listings": self.listings, "worst_tier": self.worst_tier,
+                "read": self.read, "unread": self.unread}
+
+
+def reputation_score(ctx) -> ReputationScore | None:
+    """Score the blocklist verdict, or None when the stage did not run."""
+    rep = getattr(ctx, "reputation", None) or {}
+    if not rep:
+        return None
+    read = sorted(rep.get("clean") or {})
+    listed = sorted({r.get("vendor", "") for r in rep.get("listings") or []})
+    unread = list(rep.get("unavailable") or [])
+    n_read = len(read) + len(listed)
+    if not n_read:
+        # Asked and refused by everything, or never asked. Either way nothing
+        # was measured, so nothing is published.
+        return ReputationScore(
+            None, "No source returned a usable answer, so no reputation score "
+            "is published — see the sources table for what each one said.",
+            0, len(unread), unread=unread)
+
+    worst, agree = rep.get("worst_tier") or "", rep.get("agree") or 0
+    if not worst:
+        return ReputationScore(
+            CLEAN_REPUTATION,
+            f"No listing on any of the {n_read} source"
+            f"{'s' if n_read != 1 else ''} that answered.",
+            n_read, len(unread), 0, "", read, unread)
+
+    for tier, floor, value, why in REPUTATION_BANDS:
+        if tier == worst and agree >= floor:
+            return ReputationScore(
+                value,
+                f"{agree} {worst}-level listing"
+                f"{'s' if agree != 1 else ''} — {why}.",
+                n_read, len(unread), len(rep.get("listings") or []), worst,
+                read + listed, unread)
+    # A tier with no band is a tier somebody added without deciding what it is
+    # worth. Score it as the mildest listing rather than as clean.
+    return ReputationScore(
+        92, f"Listed at an unrecognised level ({worst}), scored as the mildest "
+            "listing until the band table says otherwise.",
+        n_read, len(unread), len(rep.get("listings") or []), worst,
+        read + listed, unread)
+
+
+# --------------------------------------------------------------------------
+# Spam and phishing posture
+#
+# Two more numbers shown beside the reputation score, and like it, **never part
+# of the overall**. Unlike it they are not banded verdicts — they are weighted
+# compliance checklists against published standards (RFC 7208 for SPF, RFC 7489
+# for DMARC, RFC 6376 for DKIM), so each row is pass / partial / fail with its
+# weight printed. That is the honest form here: these are not ratios over the
+# site's pages, and pretending they pass through a calibrated window would be
+# borrowing authority the measurement does not have. Every row carries its own
+# fix, because a posture score whose rows cannot be acted on is a number for its
+# own sake.
+#
+# The split between them is a split of concerns, not a re-slicing of the same
+# facts:
+#
+#   spam      — will mail this domain sends be delivered. Existence of SPF,
+#               DKIM, DMARC and MX, SPF's record count and lookup budget, and
+#               whether the domain is on a mail blocklist.
+#   phishing  — can somebody else send as this domain, and is it on a phishing
+#               list. DMARC's *policy strength* and reporting address, SPF's
+#               final qualifier, DKIM, and phishing-list status.
+#
+# DMARC and SPF appear in both, and deliberately: their *existence* is a
+# deliverability fact and their *strength* is a spoofing fact, and those have
+# different fixes. A clean site's real phishing exposure is almost always
+# somebody sending as its domain rather than its own pages being malicious,
+# which is why `p=none` — the setting a rollout starts at and is then left at
+# for years — dominates the phishing score.
+#
+# The same rules as everywhere else: a row that could not be measured is
+# dropped and the rest renormalise, coverage is disclosed rather than charged,
+# and no answer at all means no number.
+
+# What each posture score weighs when every row could be measured. Fixed here
+# rather than summed from the rows on hand, for the reason `DECLARED_WEIGHT`
+# exists: a builder only appends a row it could measure, so summing what is
+# present makes coverage 100% by construction.
+#
+# These must equal the sum of the row weights below, and
+# `test_mailauth.py::test_the_declared_weight_matches_a_fully_populated_run`
+# asserts it. They did not: spam's rows summed to 110 against a declared 100,
+# and because `coverage` clamps at 1.0 the discrepancy was invisible — a run
+# with a row missing still reported 100% measured, which is the one thing
+# coverage exists to prevent.
+POSTURE_WEIGHT = {"spam": 100.0, "phishing": 100.0}
+
+# Spam rows, summing to 100. `spf_single` and `spf_lookups` are properties *of*
+# an SPF record, so they are not measurable when there is none — one missing
+# record is one fault, not three.
+W_SPAM = {"spf_present": 22, "spf_single": 8, "spf_lookups": 10,
+          "dkim_present": 20, "dkim_strength": 5, "dmarc_present": 15,
+          "mx_present": 5, "not_blocklisted": 15}
+# Phishing rows, summing to 100. Same rule: `dmarc_reporting` is a property of
+# a DMARC record and `spf_strict` of an SPF record.
+W_PHISH = {"dmarc_enforced": 35, "dmarc_reporting": 10, "spf_strict": 20,
+           "dkim_key": 15, "not_phish_listed": 20}
+
+# How much enforcement each DMARC policy actually requests. `none` is zero on an
+# *enforcement* row by definition — it asks receivers to take no action. The
+# credit for publishing a record at all belongs to the spam score's "DMARC
+# record published" row, and crediting it here too made an unenforced domain
+# look partly protected. `quarantine` at 0.6 is a judgement: failing mail is
+# filed as spam rather than refused, which is real but weaker protection.
+DMARC_ENFORCEMENT = {"reject": 1.0, "quarantine": 0.6, "none": 0.0}
+
+# What SPF's final qualifier is worth as anti-spoofing. `~all` is a soft fail —
+# partial, not a failure of the record.
+SPF_STRICTNESS = {"-": 1.0, "~": 0.5, "?": 0.1, "+": 0.0}
+
+# A sentence both posture descriptions carry, because the distinction is the
+# most common way a report like this is over-read.
+DNS_ONLY_NOTE = (
+    "These are checks of the records published in DNS. Whether live messages "
+    "are actually signed, authenticate and align with the visible From domain "
+    "is not observed here \u2014 that needs the headers of a received message.")
+
+# Vendors whose listing is specifically a phishing report rather than a generic
+# reputation verdict. Used to decide which listings the phishing score answers
+# for; everything else is left to the reputation score.
+PHISH_VENDORS = frozenset(x.lower() for x in (
+    "Phishtank", "OpenPhish", "Phishing Database", "PhishFort", "PhishLabs",
+    "Phishing Army (extended)", "Netcraft", "Segasec", "SafeToOpen",
+    "Bfore.Ai PreCrime",
+))
+PHISH_WORDS = ("phish", "social engineering", "social_engineering", "scam",
+               "deceptive", "fraud")
+
+
+@dataclass
+class PostureScore:
+    """A weighted compliance checklist rendered as a number. Never in `overall`."""
+
+    key: str
+    name: str
+    what: str
+    metrics: list[Metric] = field(default_factory=list)
+    note: str = ""
+
+    @property
+    def measured(self) -> list[Metric]:
+        return [m for m in self.metrics if m.measured]
+
+    @property
+    def score(self) -> int | None:
+        got = self.measured
+        if not got:
+            return None
+        w = sum(m.weight for m in got)
+        return int(round(100 * sum(m.score * m.weight for m in got) / w)) if w \
+            else None
+
+    @property
+    def grade(self) -> str:
+        return band(self.score)[0]
+
+    @property
+    def severity(self) -> str:
+        return band(self.score)[1]
+
+    @property
+    def coverage(self) -> float:
+        declared = POSTURE_WEIGHT.get(self.key) or sum(
+            m.weight for m in self.metrics)
+        got = sum(m.weight for m in self.measured)
+        return min(1.0, got / declared) if declared else 0.0
+
+    @property
+    def confidence(self) -> str:
+        cov = self.coverage
+        return "high" if cov >= 0.85 else "medium" if cov >= 0.5 else "low"
+
+    @property
+    def worst(self) -> list[Metric]:
+        """Rows losing the most, for the one-line summary."""
+        return sorted((m for m in self.measured if m.score < 1),
+                      key=lambda m: -m.lost)
+
+    @property
+    def basis(self) -> str:
+        if self.score is None:
+            return self.note or "Nothing could be measured, so no score."
+        bad = self.worst
+        if not bad:
+            return f"Every check passed ({len(self.measured)} of them)."
+        lead = bad[0]
+        return (f"{len(bad)} of {len(self.measured)} checks below target; "
+                f"the most costly is {lead.label.lower()} "
+                f"(&minus;{lead.lost:.0f}).")
+
+    def as_dict(self) -> dict:
+        return {"key": self.key, "name": self.name, "score": self.score,
+                "grade": self.grade, "band": self.severity,
+                "weighted_into_overall": False, "what": self.what,
+                "basis": _plain_text(self.basis),
+                "coverage": round(self.coverage, 3),
+                "confidence": self.confidence, "note": self.note,
+                "metrics": [m.as_dict() for m in self.metrics]}
+
+
+def _plain_text(markup: str) -> str:
+    """Tags out and entities resolved, for a field a JSON consumer reads."""
+    from html import unescape
+
+    return re.sub(r"\s+", " ",
+                  unescape(re.sub(r"<[^>]+>", "", markup or ""))).strip()
+
+
+def _tier_answered(rep: dict, tiers: tuple[str, ...]) -> bool:
+    """Did any source at one of these tiers actually answer this run?"""
+    got = rep.get("tiers") or {}
+    if got:
+        return any(t in tiers for t in got.values())
+    # No tier map (an older record, or a synthetic one): fall back to whether
+    # anything answered at all, which is the previous behaviour.
+    return bool(rep.get("clean"))
+
+
+def _mail_listings(rep: dict) -> list[dict]:
+    return [r for r in (rep.get("listings") or []) if r.get("tier") == "mail"]
+
+
+def _phish_listings(rep: dict) -> list[dict]:
+    """Listings that are specifically a phishing report.
+
+    A generic reputation verdict is not one, and counting it here would charge
+    the same listing to two different scores under two different names.
+    """
+    out = []
+    for r in rep.get("listings") or []:
+        vendor = (r.get("vendor") or "").lower()
+        blob = f"{r.get('result', '')} {r.get('detail', '')}".lower()
+        if vendor in PHISH_VENDORS or any(w in blob for w in PHISH_WORDS):
+            out.append(r)
+    return out
+
+
+def spam_score(ctx) -> PostureScore | None:
+    """Deliverability: will mail this domain sends reach an inbox."""
+    mail = getattr(ctx, "mailauth", None) or {}
+    rep = getattr(ctx, "reputation", None) or {}
+    if not mail and not rep:
+        return None
+    ps = PostureScore(
+        "spam", "Spam posture",
+        "Whether the records that decide how mail from this domain is "
+        "treated are in place and internally valid. " + DNS_ONLY_NOTE)
+
+    if mail.get("control_ok") is False or (not mail and rep):
+        ps.note = ("The mail records could not be read on this run"
+                   + (f" — {mail['unavailable'][0]}" if mail.get("unavailable")
+                      else "") + ".")
+    else:
+        spf = mail.get("spf") or {}
+        dkim = mail.get("dkim") or {}
+        dmarc = mail.get("dmarc") or {}
+        mx = mail.get("mx") or {}
+
+        if "present" in spf:
+            ps.metrics.append(Metric(
+                "spf_present", "SPF record published", W_SPAM["spf_present"],
+                1.0 if spf["present"] else 0.0,
+                spf.get("record", "")[:90] if spf["present"]
+                else "no v=spf1 record on the domain",
+                "one SPF record",
+                "Publish a single TXT record listing every service that sends "
+                "as this domain &mdash; your mail host, and every application "
+                "that sends transactional mail (the CRM, the quote form, the "
+                "invoicing tool). An unauthenticated domain is weighed far more "
+                "harshly by receivers than a small volume of complaints.",
+                ("MAIL-01",)))
+            if spf["present"]:
+                ps.metrics.append(Metric(
+                    "spf_single", "Exactly one SPF record", W_SPAM["spf_single"],
+                    1.0 if spf.get("count", 1) == 1 else 0.0,
+                    f"{spf.get('count', 1)} v=spf1 records",
+                    "exactly one",
+                    "Two SPF records is a permanent error under RFC 7208 "
+                    "&sect;4.5: receivers stop evaluating and SPF fails "
+                    "outright, so the domain is worse off than with no record "
+                    "at all. Merge them into one, combining their "
+                    "<code>include:</code> mechanisms.",
+                    ("MAIL-02",)))
+                if spf.get("lookups") is not None:
+                    over = spf.get("over_limit")
+                    ps.metrics.append(Metric(
+                        "spf_lookups", "SPF within the lookup budget",
+                        W_SPAM["spf_lookups"],
+                        0.0 if over else 1.0,
+                        f"{spf['lookups']} of {spf.get('lookup_limit', 10)} "
+                        "DNS-querying mechanisms",
+                        f"&le;{spf.get('lookup_limit', 10)} lookups",
+                        "Over ten DNS-querying mechanisms, SPF evaluation is a "
+                        "<code>permerror</code> and simply fails &mdash; the "
+                        "record looks configured and does nothing. Remove "
+                        "<code>include:</code> entries for services no longer "
+                        "used, and replace the rest with the specific "
+                        "<code>ip4:</code>/<code>ip6:</code> ranges where the "
+                        "provider publishes them.",
+                        ("MAIL-03",)))
+
+        if "present" in dkim:
+            found = dkim.get("found") or []
+            live = [f for f in found if not f.get("revoked")]
+            probed = len(dkim.get("probed") or [])
+            # **Undetermined, not absent.** DKIM publishes no way to enumerate
+            # selectors — only the receiver of a signed message learns one — so
+            # "none of the conventional names answered" cannot distinguish a
+            # domain with no DKIM from one signing under a private selector.
+            # Scoring it 0 charged 20 points for a fact the tool cannot
+            # establish. Dropped as unmeasured instead, the way every other
+            # unmeasurable metric in this model is, with the gap disclosed in
+            # coverage and named by MAIL-04.
+            ps.metrics.append(Metric(
+                "dkim_present", "DKIM key published in DNS",
+                W_SPAM["dkim_present"],
+                1.0 if live else None,
+                ", ".join(f"{f['selector']} ({f['bits']}-bit)" for f in live)
+                if live else
+                f"no key on any of the {probed} conventional selector names",
+                "at least one signing key",
+                "Turn on DKIM signing at your mail provider and publish the "
+                "public key it gives you. DKIM is the only one of the three "
+                "that survives forwarding, and DMARC cannot be enforced "
+                "without it.",
+                ("MAIL-04",),
+                note="" if live else
+                (f"Not scored: {probed} conventional selector names were "
+                 "probed and none answered, which cannot be told apart from a "
+                 "domain signing under a selector only its receivers see. "
+                 "Confirm with your mail provider \u2014 see MAIL-04.")))
+            weak = dkim.get("weak") or []
+            # Always present, so the declared weight does not depend on the
+            # answer; unmeasurable when there is no key to measure.
+            ps.metrics.append(Metric(
+                "dkim_strength", "DKIM key at 2048 bits or more",
+                W_SPAM["dkim_strength"],
+                None if not live else (0.0 if weak else 1.0),
+                ", ".join(f"{f['selector']} is ~{f['bits']}-bit" for f in weak)
+                if weak else
+                (", ".join(f"{f['selector']} ~{f['bits']}-bit" for f in live)
+                 if live else "no key found to measure"),
+                "2048-bit or stronger",
+                "Rotate the selector to a 2048-bit key; 1024-bit RSA is below "
+                "what large receivers now expect. The bit length is estimated "
+                "from the length of the published key, not parsed from it.",
+                ("MAIL-05",),
+                note="" if live else "Not scored: no published key was found."))
+
+        if "present" in dmarc:
+            ps.metrics.append(Metric(
+                "dmarc_present", "DMARC record published",
+                W_SPAM["dmarc_present"],
+                1.0 if dmarc["present"] else 0.0,
+                (f"p={dmarc.get('policy') or '(none given)'}"
+                 if dmarc["present"] else "no _dmarc record"),
+                "a DMARC record",
+                "Publish <code>_dmarc</code> with <code>v=DMARC1; p=none; "
+                "rua=mailto:&hellip;</code> to start receiving reports, then "
+                "raise the policy once they are clean. Without DMARC, SPF and "
+                "DKIM results are advisory and nothing tells you who is "
+                "sending as your domain.",
+                ("MAIL-06",)))
+
+        if "present" in mx:
+            # RFC 7505: a single `0 .` is a null MX — an explicit declaration
+            # that the domain accepts no mail. Not a missing record to be fixed,
+            # and not a working mail route either, so it is neither pass nor
+            # fail: the domain still cannot receive replies or bounces.
+            null_mx = bool(mx.get("null_mx"))
+            ps.metrics.append(Metric(
+                "mx_present", "MX record published", W_SPAM["mx_present"],
+                1.0 if mx["present"] else (0.5 if null_mx else 0.0),
+                f"{len(mx.get('records') or [])} MX records" if mx["present"]
+                else ("a null MX (<code>0 .</code>) — the domain declares that "
+                      "it accepts no mail (RFC 7505)" if null_mx
+                      else "no MX record — this domain cannot receive mail"),
+                "at least one MX",
+                "Publish MX records pointing at your mail host. A domain with "
+                "no MX cannot receive replies, bounces or the confirmation "
+                "codes its own forms send, and receivers treat a domain that "
+                "cannot accept mail as a weaker sender.",
+                ("MAIL-07",)))
+
+    # Measurable only if a mail blocklist actually answered. A run where all
+    # three were refused must drop this row, not pass it — "no mail blocklist
+    # listed it" and "no mail blocklist would talk to us" are the same sentence
+    # from the outside and only one of them is good news.
+    listings = _mail_listings(rep)
+    if _tier_answered(rep, ("mail",)) or listings:
+        ps.metrics.append(Metric(
+            "not_blocklisted", "Not on a mail blocklist",
+            W_SPAM["not_blocklisted"],
+            0.0 if listings else 1.0,
+            (", ".join(sorted({r["vendor"] for r in listings})) if listings
+             else "not listed by any mail blocklist that answered"),
+            "no listing",
+            "Find what sent the mail that earned the listing before requesting "
+            "removal &mdash; an unprotected contact or quote form being used as "
+            "a relay is the usual cause &mdash; then use each list's own "
+            "removal page. A delisting requested while the cause is live is "
+            "re-listed within days. See REP-02.",
+            ("REP-02",)))
+    return ps
+
+
+def phishing_score(ctx) -> PostureScore | None:
+    """Spoofing resistance, and phishing-list status."""
+    mail = getattr(ctx, "mailauth", None) or {}
+    rep = getattr(ctx, "reputation", None) or {}
+    if not mail and not rep:
+        return None
+    ps = PostureScore(
+        "phishing", "Phishing posture",
+        "How hard the published records make it for somebody else to send "
+        "mail as this domain, and whether the domain appears on a phishing "
+        "list. For a site that is not itself malicious, being impersonated is "
+        "the whole of its phishing exposure. " + DNS_ONLY_NOTE)
+
+    if mail.get("control_ok") is False or (not mail and rep):
+        ps.note = ("The mail records could not be read on this run"
+                   + (f" — {mail['unavailable'][0]}" if mail.get("unavailable")
+                      else "") + ".")
+    else:
+        dmarc = mail.get("dmarc") or {}
+        spf = mail.get("spf") or {}
+        dkim = mail.get("dkim") or {}
+
+        if "present" in dmarc:
+            policy = (dmarc.get("policy") or "") if dmarc["present"] else ""
+            value = DMARC_ENFORCEMENT.get(policy, 0.0)
+            pct = str(dmarc.get("pct") or "100")
+            # RFC 7489 §6.3: `pct` is the share of messages the *requested
+            # policy* applies to. The rest are treated as the next policy down,
+            # which in practice means no enforcement — so a partial rollout is
+            # that blend, not the policy scaled by a floor. With `p=none` there
+            # is no policy to sample, so `pct` changes nothing and applying it
+            # was simply wrong.
+            if policy in ("quarantine", "reject") and pct.isdigit():
+                share = max(0, min(100, int(pct))) / 100
+                value = share * value
+            ps.metrics.append(Metric(
+                "dmarc_enforced", "DMARC policy enforced",
+                W_PHISH["dmarc_enforced"], value,
+                (f"p={policy or '(not given)'}"
+                 f"{f', pct={pct}' if pct != '100' else ''} &mdash; "
+                 f"{dmarc.get('policy_state', 'unrecognised')}")
+                if dmarc["present"] else "no DMARC record at all",
+                "p=reject at pct=100",
+                "<code>p=none</code> requests monitoring rather than "
+                "enforcement: it asks receivers to report on mail that fails "
+                "authentication but not to quarantine or reject it, so what "
+                "happens to a spoofed message is left entirely to each "
+                "receiver's own anti-abuse systems. An enforcing policy is what "
+                "removes that discretion. Read the aggregate reports for a "
+                "fortnight, fix whatever legitimate sender fails, then move to "
+                "<code>p=quarantine</code> and then <code>p=reject</code> at "
+                "<code>pct=100</code>. This is the highest-value change on this "
+                "list for anyone who quotes or invoices by email.",
+                ("MAIL-08",)))
+            if dmarc["present"]:
+                ps.metrics.append(Metric(
+                    "dmarc_reporting", "DMARC reports are collected",
+                    W_PHISH["dmarc_reporting"],
+                    1.0 if dmarc.get("rua") else 0.0,
+                    ("reports go to "
+                     + (dmarc.get("rua") or "").replace("mailto:", "")[:70])
+                    if dmarc.get("rua") else
+                    "no rua= address, so nobody receives the reports",
+                    "an rua= address",
+                    "Add <code>rua=mailto:&hellip;</code>. Without it a "
+                    "<code>p=none</code> record is not even doing the one job "
+                    "<code>p=none</code> exists for &mdash; you cannot see who "
+                    "is sending as the domain, so you can never safely raise "
+                    "the policy.",
+                    ("MAIL-09",)))
+
+        if spf.get("present"):
+            qual = spf.get("all_qualifier") or ""
+            value = SPF_STRICTNESS.get(qual, 0.0)
+            # More than one `v=spf1` record is a permerror: evaluation stops and
+            # no qualifier from any of them is in force, so scoring the first
+            # record's `~all` as half credit describes a policy that does not
+            # apply.
+            effective = spf.get("effective", True)
+            if not effective:
+                value = 0.0
+            where = (f" (inherited from <code>{spf['all_from_redirect']}</code> "
+                     "via <code>redirect=</code>)"
+                     if spf.get("all_from_redirect") else "")
+            detail = (
+                "no qualifier is in force &mdash; the domain publishes more "
+                "than one SPF record, which is a permanent error"
+                if not effective else
+                f"ends <code>{qual}all</code>{where} &mdash; "
+                f"{spf.get('all_meaning', 'no final all mechanism')}")
+            ps.metrics.append(Metric(
+                "spf_strict", "SPF ends in a hard fail", W_PHISH["spf_strict"],
+                value, detail,
+                "-all",
+                "Once the SPF record lists every legitimate sender, change the "
+                "final mechanism from <code>~all</code> to <code>-all</code>. "
+                "A soft fail tells receivers to accept the mail anyway, which "
+                "is the right setting during rollout and the wrong one to leave "
+                "in place."
+                + (" This record also carries <code>+a</code>/<code>+mx</code>, "
+                   "which authorises whatever the domain's own A and MX records "
+                   "point at &mdash; on shared hosting that is every other site "
+                   "on the machine." if spf.get("broad") else ""),
+                ("MAIL-10",)))
+
+        if "present" in dkim:
+            live = [f for f in (dkim.get("found") or []) if not f.get("revoked")]
+            probed = len(dkim.get("probed") or [])
+            # Renamed from "DKIM available for DMARC alignment": a key in DNS is
+            # not evidence that live mail is signed, that the signature
+            # verifies, or that the signing domain aligns with the visible From
+            # \u2014 all three need a received message. The row says what it
+            # actually checks.
+            ps.metrics.append(Metric(
+                "dkim_key", "DKIM key published (required for DMARC alignment)",
+                W_PHISH["dkim_key"],
+                1.0 if live else None,
+                f"{len(live)} selector{'s' if len(live) != 1 else ''} publish a "
+                f"key: {', '.join(f['selector'] for f in live)}" if live else
+                f"no key on any of the {probed} conventional selector names",
+                "at least one signing key",
+                "DMARC passes on SPF <em>or</em> DKIM alignment, and DKIM is "
+                "the one that survives forwarding and mailing lists, so "
+                "enforcing DMARC without it breaks legitimate forwarded mail. "
+                "A key in DNS is a prerequisite and not a guarantee: whether "
+                "messages are signed and aligned can only be confirmed from a "
+                "received message or from DMARC aggregate reports.",
+                ("MAIL-04",),
+                note="" if live else
+                (f"Not scored: {probed} conventional selector names were "
+                 "probed and none answered, which does not establish that the "
+                 "domain has no DKIM.")))
+
+    # Same rule: a phishing list has to have answered.
+    listings = _phish_listings(rep)
+    if _tier_answered(rep, ("browser", "gateway", "feed")) or listings:
+        ps.metrics.append(Metric(
+            "not_phish_listed", "Not on a phishing list",
+            W_PHISH["not_phish_listed"],
+            0.0 if listings else 1.0,
+            (", ".join(sorted({r["vendor"] for r in listings})) if listings
+             else "not on any phishing list that answered"),
+            "no listing",
+            "Confirm against Google Safe Browsing and Search Console first, "
+            "then look for what a phishing feed would have reacted to: a login "
+            "or payment form that imitates another brand, an uploaded file "
+            "under <code>/uploads/</code>, or a redirect that only fires for "
+            "some visitors. Remove it before disputing anything &mdash; see "
+            "REP-01 and REP-02.",
+            ("REP-01", "REP-02")))
+    return ps
+
+
 @dataclass
 class Gate:
     reason: str
@@ -479,6 +1140,11 @@ class Score:
     truncated: bool = False
     notes: list[str] = field(default_factory=list)
     model: str = MODEL
+    # Shown next to the overall and never inside it — see REPUTATION_BANDS
+    # and POSTURE_WEIGHT.
+    reputation: ReputationScore | None = None
+    spam: PostureScore | None = None
+    phishing: PostureScore | None = None
 
     def get(self, key: str) -> Category | None:
         return next((c for c in self.categories if c.key == key), None)
@@ -1575,6 +2241,30 @@ def _gates(ctx, result) -> list[Gate]:
                 "Replace <code>Disallow: /</code> with the specific paths that "
                 "genuinely need excluding."))
 
+    # A blocklist listing is not a scored metric, and deliberately so: every SEO
+    # metric here is a ratio measured over this site's own pages, and a third
+    # party's opinion is neither a ratio nor a property of the pages. The
+    # denominator a ratio would need — "how many vendors VirusTotal polls this
+    # month" — moves without the site changing, so "4 of 89" cannot be put
+    # through a calibrated window and cannot be compared between two runs.
+    #
+    # A browser-level listing is a gate instead, which is what gates are for: no
+    # weighted average can express a site whose visitors are shown a full-page
+    # warning before the page loads. The cap is the lowest of them all, below the
+    # mostly-noindex cap of 25, because noindex only removes a site from search
+    # while an interstitial also turns away the people who typed the domain in.
+    # Only `browser` tier fires it — never an aggregate count, and never a
+    # single web-filter categoriser. See `audit/reputation.py`.
+    rep = getattr(ctx, "reputation", None) or {}
+    if rep.get("worst_tier") == "browser":
+        who = ", ".join(sorted({r["vendor"] for r in rep.get("at_worst") or []}))
+        out.append(Gate(
+            f"{who} lists this host as malicious, so browsers show a full-page "
+            "warning before the page loads.", 20,
+            "Find and remove the cause, rotate every credential, then request a "
+            "review in Search Console — see REP-01. Nothing else in this report "
+            "matters until the listing is cleared."))
+
     home = ctx.cfg.base.rstrip("/") + "/"
     fetched = {r["url"]: r for r in ctx.records}
     rec = fetched.get(home) or fetched.get(ctx.cfg.base)
@@ -1638,6 +2328,9 @@ def compute(result, ctx) -> Score:
             if opp.findings:
                 opp.findings = tuple(f for f in opp.findings if f in fired)
 
+    rep_score = reputation_score(ctx)
+    spam = spam_score(ctx)
+    phishing = phishing_score(ctx)
     gates = _gates(ctx, result)
     total = raw
     for gate in gates:
@@ -1696,4 +2389,5 @@ def compute(result, ctx) -> Score:
     return Score(overall=overall, grade=word, severity=sev, raw=raw,
                  categories=cats, gates=gates,
                  pages_scored=ctx.n, pages_discovered=ctx.discovered or ctx.n,
-                 truncated=bool(ctx.truncated), notes=notes)
+                 truncated=bool(ctx.truncated), notes=notes,
+                 reputation=rep_score, spam=spam, phishing=phishing)

@@ -122,6 +122,22 @@ class AuditConfig:
     capture_shots: bool = True
     shot_limit: int = 12
 
+    # Third-party blocklist reputation (`audit/reputation.py`). True only
+    # permits the stage; whether it runs is decided by whether a key is
+    # configured, because the lookup sends the audited hostname to Google or
+    # VirusTotal and nothing should do that on a bare install. At most two
+    # lookups per source per run, so the VirusTotal free key's 4-per-minute
+    # limit is never the thing that fails a run.
+    check_reputation: bool = True
+    reputation_timeout: int = 12
+    # The free downloadable blocklists (URLhaus, Phishing Army). Opt-in, and
+    # separately from `check_reputation`, for two reasons: each is a
+    # multi-megabyte download, and the licences differ — Phishing Army is
+    # CC BY-NC, which a paid audit cannot rely on. Cached for 12 hours, so the
+    # cost lands once rather than once per run.
+    check_reputation_feeds: bool = False
+    reputation_cache: str = ""
+
     # None = auto-detect: from the hostname before the crawl, then from what the
     # crawl found. An explicit True/False from the caller is respected as stated
     # and never overridden.

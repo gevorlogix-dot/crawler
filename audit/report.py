@@ -227,7 +227,16 @@ details.fix .body .also{margin-top:7px;font-family:var(--mono);font-size:11px;
 .qa{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:9px 16px;
   align-items:baseline;border-top:1px solid var(--rule-soft);padding-top:13px}
 .qa dt{padding-top:2px}
-.qa dd{margin:0;color:var(--ink-soft);font-size:13.5px;max-width:82ch}
+.qa dd{margin:0;color:var(--ink-soft);font-size:13.5px;max-width:82ch;
+  overflow-wrap:anywhere}
+.repsrc td:first-child{font-weight:520;white-space:nowrap}
+.repsrc .verdict{white-space:nowrap}
+.repprov td{border-top:0;padding-top:0;font-size:12.5px;color:var(--ink-faint);
+  overflow-wrap:anywhere}
+.repprov code{font-size:.92em;overflow-wrap:anywhere}
+.repprov .lbl{color:var(--ink-soft);letter-spacing:.02em}
+.repunread{margin:4px 0 22px;padding-left:18px;font-size:13px;color:var(--ink-soft)}
+.repunread li{margin:6px 0;overflow-wrap:anywhere}
 .ev{margin:14px 0 0}
 .ev pre{margin:6px 0 0;padding:12px 14px;background:var(--surface-2);
   border:1px solid var(--rule-soft);border-left:2px solid var(--rule);overflow-x:auto;
@@ -391,6 +400,12 @@ details.urls[open] summary::before{content:"\2212"}
 
 CATEGORY_BLURB = {
     "Security and exposure": "Files and endpoints this server hands to anyone who asks.",
+    "Email authentication": "SPF, DKIM and DMARC as the domain publishes them "
+                            "\u2014 records it controls, so every fix here is one "
+                            "DNS change.",
+    "Reputation and blocklists": "What third-party blocklists already say about this "
+                                 "host, ranked by what a listing does to a visitor "
+                                 "rather than by how many vendors voted.",
     "Content and copy": "What a visitor actually reads, checked in the rendered page.",
     "Orphans and internal linking": "From the real internal link graph — inbound link "
                                     "counts and shortest path from the homepage.",
@@ -906,6 +921,49 @@ def _score_tiles(score) -> str:
             f'Confidence {score.confidence} — {round(100 * score.coverage)}% of the '
             f'model\'s weight measured.</p>'
             '</div>']
+    for posture in (getattr(score, "spam", None),
+                    getattr(score, "phishing", None)):
+        if posture is None:
+            continue
+        if posture.score is None:
+            cells.append(
+                f'<div><span class="k">{escape(posture.name)} · not in overall'
+                '</span><div class="na">&mdash;</div>'
+                f'<p class="basis">{escape(posture.note or posture.basis)}</p>'
+                '</div>')
+            continue
+        cells.append(
+            f'<div><span class="k">{escape(posture.name)} · not in overall</span>'
+            f'<div class="num">{posture.score}<span class="of">/100</span></div>'
+            f'<div class="chip">{sev_chip(posture.severity, posture.grade)}</div>'
+            f'{_meter(posture.score, posture.severity)}'
+            f'<p class="basis">{posture.basis} '
+            f'<a href="#mail-auth" style="text-decoration:none">'
+            f'{len(posture.measured)} checks</a> — confidence '
+            f'{posture.confidence}.</p></div>')  # noqa: E501 - see _mail_section
+
+    rep = getattr(score, "reputation", None)
+    if rep is not None:
+        if rep.score is None:
+            cells.append(
+                '<div><span class="k">Reputation · not in overall</span>'
+                '<div class="na">&mdash;</div>'
+                f'<p class="basis">{escape(rep.basis)}</p></div>')
+        else:
+            cells.append(
+                '<div><span class="k">Reputation · not in overall</span>'
+                f'<div class="num">{rep.score}<span class="of">/100</span></div>'
+                f'<div class="chip">{sev_chip(rep.severity, rep.grade)}</div>'
+                f'{_meter(rep.score, rep.severity)}'
+                f'<p class="basis">{escape(rep.basis)} '
+                f'<a href="#reputation" style="text-decoration:none">'
+                f'{rep.sources_read} source'
+                f'{"s" if rep.sources_read != 1 else ""} read</a>'
+                + (f", {rep.sources_unread} unreadable" if rep.sources_unread
+                   else "")
+                + f" — confidence {rep.confidence}."
+                '</p></div>')
+
     for cat in score.categories:
         if cat.total is None:
             cells.append(
@@ -1190,6 +1248,374 @@ def _gate_callout(score) -> str:
             f'cap: {score.raw:.0f}.</p>{rows}</div>')
 
 
+# Tier -> the chip a listing at that level earns. Status hue only, never a new
+# one: `theme.sev_chip` is the single sanctioned way to draw a status, and a
+# listing's colour has to mean the same thing here as it does on a finding.
+REP_TIER_CHIP = {"browser": "critical", "gateway": "high", "mail": "high",
+                 "endpoint": "medium", "feed": "low", "unknown": "low"}
+
+# Read in the report's own words, next to the verdicts, because a reader handed
+# "4 of 89 vendors" by someone else needs to see why this report does not print
+# that number.
+REP_METHOD = (
+    "Every source below was asked about this host directly. None of them is a "
+    "vote, and the count of how many flagged it is not used: an aggregate like "
+    "&ldquo;4 of 89 vendors&rdquo; has no usable denominator &mdash; it is how "
+    "many feeds the aggregator polls this month, and it moves without the site "
+    "changing. What is used is <strong>what a listing at each source actually "
+    "does to a visitor</strong>, which is the column on the right.")
+REP_CONTROL_NOTE = (
+    "Each source is also asked about a domain it publishes as a known-bad test "
+    "point, on the same run and through the same request. If that control does "
+    "not come back listed, the source is reported as <em>not read</em> rather "
+    "than as a pass &mdash; two of these lists answer a refused query in a way "
+    "that reads exactly like a clean answer, so without the control this "
+    "section would be publishing verdicts nobody measured.")
+
+
+def _rep_verdict_chip(rec: dict) -> str:
+    if rec.get("error") or "listed" not in rec and not rec.get("hits"):
+        if rec.get("hits") is None and rec.get("error"):
+            return sev_chip("low", "not read")
+    if rec.get("hits"):
+        return sev_chip(REP_TIER_CHIP.get(rec.get("tier", ""), "low"), "listed")
+    if rec.get("listed"):
+        return sev_chip(REP_TIER_CHIP.get(rec.get("tier", ""), "low"), "listed")
+    if rec.get("error"):
+        return sev_chip("low", "not read")
+    if rec.get("no_record"):
+        return sev_chip("low", "no record")
+    return sev_chip("good", "not listed")
+
+
+def _rep_rows(sources: list[dict]) -> str:
+    """One row per source, with its provenance on the line beneath it.
+
+    Two lines rather than eight columns: the endpoint is a URL and the method is
+    a sentence, and neither survives a 360px column. This is the same shape
+    `_url_list` uses for a page's extra hits.
+    """
+    order = {"safe_browsing": 0, "web_risk": 1, "resolver": 2, "dnsbl": 3,
+             "feed": 4, "virustotal": 5}
+    rows = []
+    for rec in sorted(sources, key=lambda r: (order.get(r.get("source"), 9),
+                                              (r.get("vendor") or "").lower())):
+        vendor = rec.get("vendor") or rec.get("source") or "unknown source"
+        tier = rec.get("tier") or ""
+        # A real em dash, not an entity: this string is escaped below, and an
+        # escaped entity renders as its own source text.
+        consequence = (theme_tiers().get(tier, (0, ""))[1] if tier else
+                       "not a blocking list \u2014 breadth only")
+        rows.append(
+            f'<tr class="repsrc"><td>{escape(vendor)}</td>'
+            f'<td class="verdict">{_rep_verdict_chip(rec)}</td>'
+            f'<td>{escape(consequence)}</td></tr>')
+
+        bits = []
+        if rec.get("endpoint"):
+            bits.append(f'<span class="lbl">asked</span> '
+                        f'<code>{escape(rec["endpoint"])}</code>')
+        ok = rec.get("control_ok")
+        if ok is False:
+            # The target was never queried: the control failed first and the
+            # source stood down. An "answered" line here would describe a
+            # measurement that did not happen.
+            bits.append('<span class="lbl">answered</span> not asked &mdash; '
+                        'the control failed first, so this source stood down')
+        else:
+            answer = rec.get("answer") or rec.get("error") or ""
+            if answer:
+                bits.append(f'<span class="lbl">answered</span> '
+                            f'<code>{escape(str(answer))}</code>')
+        if rec.get("control"):
+            said = rec.get("control_answer")
+            bits.append(
+                f'<span class="lbl">control</span> '
+                f'<code>{escape(str(rec["control"]))}</code> &rarr; '
+                + escape(str(said if said else
+                             ("verified once for this run" if ok
+                              else "not verified")))
+                + ("" if ok is not False else " &mdash; source not read"))
+        if rec.get("method"):
+            bits.append(escape(rec["method"]))
+        if rec.get("terms"):
+            bits.append(f'<span class="lbl">terms</span> '
+                        f'{escape(rec["terms"])}')
+        rows.append('<tr class="repprov"><td colspan="3">'
+                    + " &middot; ".join(bits) + "</td></tr>")
+    return "".join(rows)
+
+
+def theme_tiers():
+    """`reputation.TIERS`, imported lazily so `report` keeps no import of a
+    stage it only renders."""
+    from . import reputation as rep_mod
+    return rep_mod.TIERS
+
+
+def _posture_rows(posture) -> str:
+    """One row per check, with its weight, what was found, and the fix.
+
+    The weight is printed because these are a weighted checklist rather than a
+    ratio through a calibrated window, and a reader who cannot see the weights
+    cannot argue with the number.
+    """
+    rows = []
+    for m in posture.metrics:
+        if not m.measured:
+            rows.append(
+                f'<tr class="repsrc"><td>{escape(m.label)}</td>'
+                f'<td class="verdict">{sev_chip("low", "not measured")}</td>'
+                f'<td class="n">{m.weight:.0f}</td><td>{m.note or ""}</td></tr>')
+            continue
+        state = ("good" if m.score >= 0.999 else
+                 "medium" if m.score >= 0.5 else "critical")
+        word = ("pass" if m.score >= 0.999 else
+                "partial" if m.score > 0 else "fail")
+        rows.append(
+            f'<tr class="repsrc"><td>{escape(m.label)}</td>'
+            f'<td class="verdict">{sev_chip(state, word)}</td>'
+            f'<td class="n">{m.weight:.0f}</td><td>{m.detail}</td></tr>')
+        if m.score < 0.999 and m.fix:
+            rows.append('<tr class="repprov"><td colspan="4">'
+                        f'<span class="lbl">target</span> {m.target} '
+                        f'&middot; {m.fix}</td></tr>')
+    return "".join(rows)
+
+
+def _posture_block(posture) -> str:
+    if posture is None:
+        return ""
+    if posture.score is None:
+        return (
+            '<div class="f" style="border-top:1px solid var(--rule)">'
+            f'<div class="fbody"><span class="k">{escape(posture.name)}</span>'
+            '<div class="na" style="margin:2px 0 0">&mdash;</div>'
+            f'<p class="mnote">{escape(posture.note or posture.basis)}</p>'
+            '</div></div>')
+    return (
+        '<div class="f" style="border-top:1px solid var(--rule)">'
+        f'<div class="fbody"><span class="k">{escape(posture.name)}</span>'
+        f'<div class="big" style="margin:2px 0 6px">{posture.score}'
+        '<span class="of">/100</span></div>'
+        f'<div class="chip">{sev_chip(posture.severity, posture.grade)}</div>'
+        f'{_meter(posture.score, posture.severity, ticks=True)}'
+        f'<p class="mnote" style="margin-top:9px">{escape(posture.what)} '
+        f'{posture.basis} Confidence {posture.confidence} — '
+        f'{round(100 * posture.coverage)}% of the checklist measured. '
+        '<strong>Not part of the overall score.</strong></p>'
+        '<div class="scroll" style="margin:9px 0 0"><table><thead><tr>'
+        '<th>Check</th><th>Result</th><th class="n">Weight</th>'
+        '<th>What was found, and what to do</th></tr></thead>'
+        f'<tbody>{_posture_rows(posture)}</tbody></table></div>'
+        '</div></div>')
+
+
+def _mail_records(mail: dict) -> str:
+    """The records as published, and the exact lookup that read each one."""
+    rows = []
+    for key, label in (("spf", "SPF"), ("dmarc", "DMARC"), ("dkim", "DKIM"),
+                       ("mx", "MX"), ("mta_sts", "MTA-STS"), ("bimi", "BIMI")):
+        rec = mail.get(key) or {}
+        if not rec:
+            continue
+        if key == "dkim":
+            live = [f for f in (rec.get("found") or []) if not f.get("revoked")]
+            value = (", ".join(
+                f"{f['selector']} ({f.get('key_type', 'rsa')}, ~{f['bits']}-bit)"
+                for f in live) if live else
+                f"no key on {len(rec.get('probed') or [])} conventional selectors")
+        elif rec.get("error"):
+            value = rec["error"]
+        else:
+            got = rec.get("records") or ([rec.get("record")] if rec.get("record")
+                                         else [])
+            value = " · ".join(g for g in got if g) or "no record published"
+        rows.append(
+            f'<tr class="repsrc"><td>{label}</td><td>{escape(value[:400])}</td>'
+            f'</tr><tr class="repprov"><td colspan="2">'
+            f'<span class="lbl">read by</span> '
+            f'<code>{escape(rec.get("endpoint", ""))}</code> &middot; '
+            f'{escape(rec.get("what", ""))}</td></tr>')
+    if not rows:
+        return ""
+    return ('<div class="f" style="border-top:1px solid var(--rule)">'
+            '<div class="fbody"><span class="k">The records, as published</span>'
+            '<div class="scroll" style="margin:9px 0 0"><table><thead><tr>'
+            '<th>Record</th><th>Value</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div></div></div>')
+
+
+def _mail_section(result, ctx) -> str:
+    """Spam and phishing posture, and the DNS records both are built from.
+
+    Rendered whenever the lookups ran, pass or fail, for the same reason the
+    reputation section is: "no findings" is not visibly different from "nobody
+    looked", and these two numbers are the ones a reader came for.
+    """
+    mail = getattr(result, "mailauth", None) or {}
+    score = getattr(result, "score", None)
+    spam = getattr(score, "spam", None)
+    phishing = getattr(score, "phishing", None)
+    if not mail and spam is None and phishing is None:
+        return ""
+
+    unread = mail.get("unavailable") or []
+    unread_html = ""
+    if unread:
+        unread_html = (
+            '<div class="f" style="border-top:1px solid var(--rule)">'
+            '<div class="fbody">'
+            '<span class="k">Not readable on this run</span>'
+            '<ul class="repunread">'
+            + "".join(f'<li>{escape(u)}</li>' for u in unread)
+            + '</ul></div></div>')
+
+    host = escape(mail.get("host", "") or urlparse(result.config.base).netloc)
+    head = (
+        '<div class="sechead"><h2>Spam and phishing posture</h2>'
+        f'<span class="count">{mail.get("lookups", 0)}</span>'
+        f'<p>Read from DNS for <code>{host}</code> &mdash; records this domain '
+        'publishes about itself, so every fix is one DNS change and nothing '
+        'here is a third party&rsquo;s opinion. Both numbers are weighted '
+        'checklists against the published standards, and neither is part of '
+        'the overall score.</p></div>')
+
+    return ('<section class="sec" id="mail-auth">' + head
+            + _posture_block(spam) + _posture_block(phishing)
+            + _mail_records(mail) + unread_html + '</section>')
+
+
+def _reputation_section(result, ctx) -> str:
+    """What the blocklists said, where each answer came from, and how it is read.
+
+    Rendered on every run, including a completely clean one. A section that only
+    appears when something is wrong cannot be used to show that nothing is: the
+    reader's actual question is "is my site flagged", and "no findings" is not
+    visibly different from "we never looked".
+    """
+    rep = getattr(result, "reputation", None) or {}
+    cfg = result.config
+    if not cfg.check_reputation and not rep:
+        return ""
+
+    sources = [r for r in (rep.get("sources") or []) if r.get("source")]
+
+    read = len(rep.get("clean") or {}) + len({
+        r.get("vendor") for r in rep.get("listings") or []})
+    unread = rep.get("unavailable") or []
+
+    head = (f'<div class="sechead"><h2>Reputation and blocklists</h2>'
+            f'<span class="count">{read}</span>'
+            f'<p>What third-party blocklists already say about this host &mdash; '
+            f'every source named, with the exact request that produced the '
+            f'answer.</p></div>')
+
+    # The score, at the head of the evidence it was derived from, so the number
+    # and its basis are never read apart.
+    rep_score = getattr(getattr(result, "score", None), "reputation", None)
+    score_html = ""
+    if rep_score is not None:
+        if rep_score.score is None:
+            score_html = (
+                '<div class="f" style="border-top:1px solid var(--rule)">'
+                '<div class="fbody">'
+                '<span class="k">Reputation score</span>'
+                '<div class="na" style="margin:2px 0 0">&mdash;</div>'
+                f'<p class="mnote">{escape(rep_score.basis)}</p>'
+                '</div></div>')
+        else:
+            score_html = (
+                '<div class="f" style="border-top:1px solid var(--rule)">'
+                '<div class="fbody">'
+                '<span class="k">Reputation score</span>'
+                f'<div class="big" style="margin:2px 0 6px">{rep_score.score}'
+                '<span class="of">/100</span></div>'
+                f'<div class="chip">{sev_chip(rep_score.severity, rep_score.grade)}'
+                '</div>'
+                f'{_meter(rep_score.score, rep_score.severity, ticks=True)}'
+                f'<p class="mnote" style="margin-top:9px">'
+                f'{escape(rep_score.basis)} Built from '
+                f'{rep_score.sources_read} source'
+                f'{"s" if rep_score.sources_read != 1 else ""} that answered'
+                + (f' and {rep_score.sources_unread} that could not be read'
+                   if rep_score.sources_unread else '')
+                + f' — confidence {rep_score.confidence}. '
+                '<strong>This number is not part of the overall score</strong> '
+                'and never moves it: every other metric in the model is a ratio '
+                'over this site&rsquo;s own pages, and a third party&rsquo;s '
+                'opinion is neither a ratio nor a property of the pages. The one '
+                'case that must move the total already does, as a cap &mdash; a '
+                'browser-level listing limits the overall to 20.</p>'
+                '<p class="mnote">An unreadable source costs no points here; it '
+                'is disclosed in the confidence instead, which is the same rule '
+                'the rest of the model follows for a stage that did not run.</p>'
+                '</div></div>')
+
+    verdict = ""
+    if rep.get("worst_tier"):
+        verdict = (
+            f'<p class="what"><strong>This host is listed.</strong> The most '
+            f'consequential listing is {escape(rep["worst_tier"])}-level &mdash; '
+            f'{escape(theme_tiers().get(rep["worst_tier"], (0, ""))[1])}. '
+            f'See REP-01&hellip;REP-03 above for what to do about it.</p>')
+    elif read:
+        verdict = (
+            f'<p class="what"><strong>No listing found.</strong> {read} '
+            f'source{"s" if read != 1 else ""} answered and none of them lists '
+            f'this host'
+            + (f'; {len(unread)} could not be read and '
+               f'{"is" if len(unread) == 1 else "are"} shown below as unread '
+               'rather than counted as a pass' if unread else '')
+            + '.</p>')
+    else:
+        verdict = ('<p class="what"><strong>Not measured.</strong> No source '
+                   'returned a usable answer on this run, so this section says '
+                   'nothing about the host either way.</p>')
+
+    unread_html = ""
+    if unread:
+        unread_html = (
+            '<span class="k">Not readable on this run</span>'
+            '<ul class="repunread">'
+            + "".join(f'<li>{escape(u)}</li>' for u in unread)
+            + '</ul>')
+
+    table = ""
+    if sources:
+        table = (
+            '<span class="k">Sources, and where each answer came from</span>'
+            '<div class="scroll" style="margin:9px 0 22px">'
+            '<table><thead><tr><th>Source</th><th>Verdict</th>'
+            '<th>What a listing here would do to a visitor</th></tr></thead>'
+            f'<tbody>{_rep_rows(sources)}</tbody></table></div>')
+
+    grading = (
+        '<span class="k">How a listing would be graded</span>'
+        '<div class="scroll" style="margin:9px 0 0"><table><thead><tr>'
+        '<th>Level</th><th>Consequence</th><th>Severity</th></tr></thead><tbody>'
+        + "".join(
+            f'<tr><td>{escape(name)}</td><td>{escape(text)}</td>'
+            f'<td class="verdict">{sev_chip(REP_TIER_CHIP.get(name, "low"))}</td></tr>'
+            for name, (_, text) in sorted(theme_tiers().items(),
+                                          key=lambda kv: kv[1][0]))
+        + '</tbody></table></div>'
+        '<p class="mnote">A browser-level listing is critical on its own &mdash; '
+        'it is not a vote, it is already happening to visitors, and it caps the '
+        'overall score at 20. At the gateway and mail levels one vendor is '
+        'reported as medium and two or more as high, because a single automated '
+        'categoriser mislabels lead-generation and local-service sites '
+        'routinely.</p>')
+
+    return ('<section class="sec" id="reputation">' + head + score_html
+            + '<div class="f" style="border-top:1px solid var(--rule)">'
+            '<div class="fbody">' + verdict
+            + f'<p class="mnote">{REP_METHOD}</p>'
+            + f'<p class="mnote" style="margin-bottom:16px">{REP_CONTROL_NOTE}</p>'
+            + table + unread_html + grading
+            + '</div></div></section>')
+
+
 def _depth_chart_generic(items: list[tuple[str, int]]) -> str:
     """Magnitude bars for any label/value pairs — one hue, value at the end."""
     if not items:
@@ -1257,6 +1683,24 @@ def render(result, ctx) -> str:
         stages.append(f"{len(ctx.link_status)} links verified")
     if cfg.check_security:
         stages.append("endpoint probes")
+    # Three states, not two: answered, attempted and refused, never asked. A
+    # line that says "1 blocklist lookup" about a 401 tells the reader the host
+    # came back clean, which is the same mistake `ERR-14` exists to stop the
+    # crawl making about a refused page.
+    rep = getattr(result, "reputation", None) or {}
+    answered = bool(rep.get("listings") or rep.get("engines")
+                    or rep.get("clean") or rep.get("web_risk_clean") is not None)
+    if answered:
+        n = len(rep.get("clean") or {}) + len({
+            r.get("vendor") for r in rep.get("listings") or []})
+        unread = len(rep.get("unavailable") or [])
+        stages.append(f"{n} blocklist source{'s' if n != 1 else ''} read"
+                      + (f" ({unread} unreadable)" if unread else ""))
+    elif rep.get("queried"):
+        why = (rep.get("unavailable") or ["no answer"])[0]
+        stages.append(f"blocklist lookup not completed ({_plain(why)[:120]})")
+    elif cfg.check_reputation:
+        stages.append("no blocklist lookup (no reputation API key configured)")
     if result.runtime:
         stages.append(f"{len(result.runtime)} pages rendered in Chromium")
     images = getattr(result, "images", None) or {}
@@ -1331,13 +1775,37 @@ def render(result, ctx) -> str:
             score_cells += (
                 f'<div class="cell"><span class="k">{escape(cat.name)}</span>'
                 f'<div class="v">{value}</div></div>')
+        for posture in (getattr(score, "spam", None),
+                        getattr(score, "phishing", None)):
+            if posture is None:
+                continue
+            pv = "&mdash;" if posture.score is None else str(posture.score)
+            label = posture.name.replace(" posture", "")
+            score_cells += (
+                f'<div class="cell"><span class="k">{escape(label)} · unweighted'
+                f'</span><div class="v">{pv}</div></div>')
+        rep = getattr(score, "reputation", None)
+        if rep is not None:
+            # Labelled "unweighted" in the masthead itself. A bare number next
+            # to SEO and Performance reads as a third weighted category, and
+            # this one deliberately moves nothing.
+            rv = "&mdash;" if rep.score is None else str(rep.score)
+            score_cells += (
+                '<div class="cell"><span class="k">Reputation · unweighted</span>'
+                f'<div class="v">{rv}</div></div>')
     # Built here rather than inline below, because the "Jump to" rail must not
     # offer a link to a section that was not rendered. The report asserts it has
     # no dead in-page anchors, and a site where nothing could be read has no
     # structured-data section to jump to.
     sd_section = _schema_section(result, ctx)
+    rep_section = _reputation_section(result, ctx)
+    mail_section = _mail_section(result, ctx)
     jump = ['<a href="#seo-score">SEO score</a>',
             '<a href="#performance-score">Performance</a>']
+    if mail_section:
+        jump.append('<a href="#mail-auth">Spam &amp; phishing</a>')
+    if rep_section:
+        jump.append('<a href="#reputation">Reputation</a>')
     if sd_section:
         jump.append('<a href="#structured-data">Structured data</a>')
     jump_html = "".join(jump)
@@ -1433,6 +1901,10 @@ def render(result, ctx) -> str:
     {_performance_section(score, base)}
 
     {findings_html}
+
+    {mail_section}
+
+    {rep_section}
 
     {sd_section}
 
