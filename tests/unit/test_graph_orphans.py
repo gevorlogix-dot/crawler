@@ -113,7 +113,7 @@ def test_single_inbound_records_where_the_one_link_came_from():
 
 def test_links_to_pages_that_were_never_crawled_are_listed_separately():
     g = graph.build([rec("/", [("/gone/", "Gone")])], BASE)
-    assert g["linked_not_listed"] == [f"{BASE}/gone/"]
+    assert g["linked_not_crawled"] == [f"{BASE}/gone/"]
 
 
 # ------------------------------------------------------------ hub candidates

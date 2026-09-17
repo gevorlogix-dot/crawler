@@ -1398,24 +1398,103 @@ def deep_pages(ctx: Ctx):
         [Hit(d["url"], f"{d['depth']} clicks deep") for d in deep])
 
 
+def _noindex(rec: dict) -> bool:
+    """Does this page ask not to be indexed, by meta tag or by header?"""
+    blob = ((rec.get("meta_robots") or "") + " "
+            + (rec.get("x_robots_tag") or "")).lower()
+    return "noindex" in blob
+
+
 @check
 def not_in_sitemap(ctx: Ctx):
-    if ctx.truncated:
-        return None   # link graph is only a sample
-    missing = ctx.graph.get("linked_not_listed", [])
-    if not missing or ctx.method != "sitemap":
+    """Pages the crawl reached by following links that the sitemap does not list.
+
+    This is a comparison against **the sitemap**, and for the life of the tool it
+    was not one. It read `graph.linked_not_listed`, which is the set of link
+    targets missing from the *crawled page list* — and the frontier fetches every
+    linked page it finds, so a page that is linked is in that list by
+    construction and the set is almost always empty. On `tourvango.com` it was:
+    24 service-area pages (`/irvine-sprinter-van-rental` and its siblings),
+    `/services`, `/reviews` and `/order` were all absent from a 77-URL sitemap,
+    all crawled, and this check reported nothing. The score knew —
+    `sitemap_coverage` scored **0.0, "77 of 113 pages"** — and because the metric
+    cites ORP-05 and `score.compute` drops a citation whose finding never fired,
+    the one row that had the fact printed it with no list of pages under it. The
+    runner even says it out loud mid-run ("Analysing 36 linked pages missing from
+    the sitemap…") and then threw the fact away.
+
+    `discovered_via` is the answer, and it is the same field the score's metric
+    counts, so the finding and the metric cannot disagree. A truncated crawl no
+    longer suppresses it either: the page cap makes this a floor rather than a
+    total — a page reached by a link is not in the sitemap whether or not the
+    crawl finished — and that is stated instead of the finding going silent.
+    """
+    if ctx.method != "sitemap":
+        return None   # nothing to compare against: discovery followed links
+    missing = [r for r in ctx.pages if r.get("discovered_via") == "link"]
+    if not missing:
         return None
+
+    listed = sum(s.get("host_urls", s.get("urls", 0)) for s in ctx.sitemaps
+                 if not str(s.get("sitemap", "")).startswith("("))
+    archive = {r["url"] for r in missing
+               if ARCHIVE_PATH.search(urlparse(r["url"]).path)}
+    excluded = {r["url"] for r in missing
+                if _noindex(r) and r["url"] not in archive}
+    real = [r for r in missing
+            if r["url"] not in archive and r["url"] not in excluded]
+
+    # An archive URL and a noindex page are the two shapes a deliberate omission
+    # takes, so a run that is only those is hygiene. A page the site links to,
+    # asks to have indexed, and leaves out of its own sitemap is the fault worth
+    # acting on, and it sets the severity.
+    sev = "medium" if real else "low"
+
+    what = (f"Every one of these pages was reached by following links from the "
+            f"site's own pages. The sitemap this audit read lists {listed} URL"
+            f"{'s' if listed != 1 else ''}, and none of these are among them.")
+    if real:
+        one = len(real) == 1
+        what += (f" {len(real)} of them {'is an ordinary indexable page' if one else 'are ordinary indexable pages'}"
+                 f", including <code>{escape(urlparse(real[0]['url']).path or '/')}</code>.")
+    if archive:
+        what += (f" {len(archive)} {'is a' if len(archive) == 1 else 'are'} pagination, "
+                 "tag, author or attachment archive "
+                 f"URL{'' if len(archive) == 1 else 's'}, which most sitemaps omit "
+                 "on purpose.")
+    if excluded:
+        what += (f" {len(excluded)} {'carries' if len(excluded) == 1 else 'carry'} a "
+                 "<code>noindex</code> directive, so their absence is already an "
+                 "explicit decision.")
+    if ctx.truncated:
+        what += (" The crawl is only a sample — "
+                 + (ctx.partial_reason or "the page limit stopped it short")
+                 + " — so this is a floor, not a total.")
+
+    def detail(r):
+        if r["url"] in archive:
+            return "archive URL, reached by following links; not in the sitemap"
+        if r["url"] in excluded:
+            return f"noindex ({r.get('meta_robots') or r.get('x_robots_tag')}); not in the sitemap"
+        return "reached by following links; not in the sitemap"
+
     return Finding(
-        "ORP-05", "low", "Orphans and internal linking",
-        f"{len(missing)} linked pages are missing from the sitemap",
-        "The site links to these URLs internally, but the sitemap does not list them.",
-        "The sitemap is the site's own list of what it wants indexed. A page the "
-        "site links to but omits sends a mixed signal, and pages discovered only "
-        "through links are crawled more slowly.",
-        "Add them to the sitemap, or if they are intentionally excluded (pagination, "
-        "filtered views), confirm they are <code>noindex</code> so the exclusion is "
-        "explicit rather than accidental.",
-        [Hit(u, "linked but not in the sitemap") for u in missing])
+        "ORP-05", sev, "Orphans and internal linking",
+        f"{len(missing)} of {ctx.n} crawled pages are missing from the sitemap",
+        what,
+        "The sitemap is the site's own list of what it wants indexed, and it is "
+        "how a search engine learns a page exists without waiting to stumble over "
+        "a link to it. A page the site links to but omits sends a mixed signal, is "
+        "crawled more slowly, and — where a whole section is missing, as a set of "
+        "location or service pages usually is — the omission is a template or "
+        "generator fault rather than a per-page one: the section was never wired "
+        "into whatever builds the sitemap.",
+        "Regenerate the sitemap from the same source the navigation is built from, "
+        "so a page cannot exist in one and not the other. Where a page is left out "
+        "on purpose — pagination, filtered views, tag archives — mark it "
+        "<code>noindex</code>, so the omission reads as a decision rather than an "
+        "oversight. Then resubmit the sitemap in Search Console.",
+        [Hit(r["url"], detail(r)) for r in missing])
 
 
 # =====================================================================
@@ -2089,8 +2168,7 @@ def horizontal_overflow(ctx: Ctx):
 @check
 def indexability(ctx: Ctx):
     def indexable(r):
-        blob = ((r.get("meta_robots") or "") + " " + (r.get("x_robots_tag") or "")).lower()
-        return "noindex" not in blob
+        return not _noindex(r)
 
     if ctx.cfg.expect_noindex:
         hits = [Hit(r["url"], r.get("meta_robots") or "no robots directive")

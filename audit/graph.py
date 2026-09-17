@@ -178,7 +178,13 @@ def build(pages: list[dict], base: str, extra_links: dict | None = None) -> dict
         elif d > 3:
             deep.append({"url": u, "depth": d})
 
-    linked_not_listed = sorted(
+    # Link targets on this host that never became a crawled page: a 404, a
+    # non-page path, or a URL the page cap cut off. **Not** "missing from the
+    # sitemap" — it was named `linked_not_listed` and read by ORP-05 as exactly
+    # that, and since the frontier fetches every linked page it finds, a linked
+    # page is in `page_set` by construction and the set is all but always empty.
+    # ORP-05 now compares against the sitemap itself, through `discovered_via`.
+    linked_not_crawled = sorted(
         {t for links in outbound.values() for t, _r, _x in links if t not in page_set})
 
     rows = sorted(
@@ -208,7 +214,7 @@ def build(pages: list[dict], base: str, extra_links: dict | None = None) -> dict
         "global_nav": global_nav,
         "deep_pages": sorted(deep, key=lambda d: -d["depth"]),
         "unreachable": unreachable,
-        "linked_not_listed": linked_not_listed,
+        "linked_not_crawled": linked_not_crawled,
         "depth_histogram": hist,
         "rendered_pages": sorted(extra_links or {}),
         "rows": rows,

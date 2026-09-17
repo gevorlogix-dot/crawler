@@ -298,7 +298,7 @@ The rules that make the number defensible, and which are easy to quietly break:
 
 ### Tests for the engine (`tests/unit/`, marker `unit`)
 
-`python -m pytest -m unit` — 733 tests, no browser and no network. The root
+`python -m pytest -m unit` — 740 tests, no browser and no network. The root
 `conftest.py` has an autouse `_page_defaults(page)` fixture that would launch
 Chromium for anything under `tests/`, so `tests/unit/conftest.py` overrides it
 with a no-op; a fixture from the nearest conftest wins. What is pinned:
@@ -1154,6 +1154,45 @@ Three causes, three answers:
   every obfuscated mailto to `/cdn-cgi/l/email-protection`, which gave it more
   inbound links than the homepage — putting it in the browser sweep, in the vitals
   sample as a 9-node "page", and into every per-page ratio the score is built from.
+
+### "Missing from the sitemap" is measured against the sitemap (`ORP-05`)
+
+A reader pointed at `https://tourvango.com/irvine-sprinter-van-rental` — a
+service-area page, linked from the site, absent from its sitemap — and asked why
+the audit had not found it. It had found it, twice, and reported it nowhere.
+
+- **`ORP-05` never read a sitemap.** It reported `graph.linked_not_listed`, which
+  is the set of link targets missing from the **crawled page list** — and the
+  frontier fetches every linked page it finds, so a linked page is in that list
+  by construction and the set is all but always empty (0 entries on that run).
+  The name said "not listed" and the finding text said "missing from the
+  sitemap"; the code said neither. It is now `graph.linked_not_crawled`, which is
+  what it has always computed — a 404, a non-page path, or a URL the page cap cut
+  off — and `ORP-05` compares against the sitemap through the page record's own
+  `discovered_via`, which is the field the score already counts. One fact, one
+  number, and the finding and the metric cannot disagree.
+- **The fact was in the run three times over.** The runner prints "Analysing 36
+  linked pages missing from the sitemap…" mid-crawl; `data.json` carries
+  `discovered_via: "link"` on all 36; and `sitemap_coverage` scored **0.0, "77 of
+  113 pages"**. Because that metric cites `ORP-05` and `score.compute` drops a
+  citation whose finding never fired, the one row carrying the fact printed it
+  with no list of pages under it and no link to one — a 3-point penalty a reader
+  could not act on. The corrected run reports **36 of 113 crawled pages are
+  missing from the sitemap**, at medium, listing all 36: 24 service-area pages,
+  `/services`, `/reviews`, `/order`.
+- **The two shapes of a deliberate omission are graded apart from the fault.**
+  Pagination/tag/author/attachment URLs (`ARCHIVE_PATH`) and pages carrying
+  `noindex` (`_noindex`, now shared with `indexability`) are what an intentional
+  exclusion looks like, so a run that is only those is **low**; one ordinary
+  indexable page in the list makes it **medium**. All of them stay in the
+  evidence with their reason in the hit detail, because the headline equals the
+  evidence rows.
+- **A truncated crawl no longer silences it.** Reachability conclusions are
+  suppressed on a partial crawl because they are drawn from a sample of the link
+  graph; this one is a fact about each page on its own, and the cap can only make
+  the list short. The finding fires and says it is a floor.
+- `tests/unit/test_sitemap_coverage.py` pins the miss and both halves of the
+  grading, plus that the finding's row count equals the metric's `n - listed`.
 
 ### Structured-data validation (`SDV-01`…`SDV-07`)
 

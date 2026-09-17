@@ -1318,10 +1318,17 @@ def _indexability(ctx, result) -> Group:
               else "")))
 
     if result.method == "sitemap" and sm_urls:
+        # The same fact ORP-05 reports, counted the same way — `discovered_via`
+        # — so the metric and the finding cannot disagree. They did worse than
+        # disagree: this row scored 0.0 ("77 of 113 pages") while ORP-05, which
+        # it cites, never fired, so the citation was dropped and the one row
+        # carrying the fact printed no list of the pages.
         listed = sum(1 for r in ctx.pages if r.get("discovered_via") != "link")
         g.metrics.append(Metric(
             "sitemap_coverage", "Crawled pages that the sitemap lists", 3,
-            win("sitemap_coverage", listed / n), f"{listed} of {n} pages", "≥97% of pages",
+            win("sitemap_coverage", listed / n),
+            f"{listed} of {n} crawled pages listed; {sm_urls} URLs in the sitemap",
+            "≥97% of pages",
             "Add the missing pages to the sitemap. Where a page is excluded on "
             "purpose — pagination, filtered views, tag archives — make the "
             "exclusion explicit by marking it <code>noindex</code>, so the omission "

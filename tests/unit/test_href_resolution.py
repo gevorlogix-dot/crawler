@@ -402,7 +402,7 @@ def test_the_duplicate_spelling_passes_its_inbound_links_to_the_real_page():
     assert row["inbound"] == 1
     # The spelling itself is not a page of the site.
     assert spelling not in [r["url"] for r in g["rows"]]
-    assert spelling not in g["linked_not_listed"]
+    assert spelling not in g["linked_not_crawled"]
 
 
 def test_the_scope_note_says_how_many_urls_were_a_second_spelling():
