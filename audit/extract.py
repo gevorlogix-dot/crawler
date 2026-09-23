@@ -204,6 +204,38 @@ png jpg jpeg webp svg gif pdf zip csv html php js css xml json mp4
 MISSING_SPACE = re.compile(r"[a-z]{2}[.,;!?][A-Z][a-zA-Z]*")
 
 
+def placeholder_hits(text: str, runs: list[str] | None = None) -> list[tuple[str, str]]:
+    """(label, matched text) for every placeholder left in one block of copy.
+
+    Module-level for the reason every other copy rule here is: inline in
+    `analyse` it was reachable only through an HTTP session, so nothing tested
+    it, and it spent the life of the tool reporting the ordinary English phrase
+    "to do:" as a developer's `TODO` marker. `\\bto ?do:` matched against a
+    lower-cased page is "what to do:", which on a travel site is a heading on
+    every article — and the pages it fired on contained no marker at all.
+
+    Two rules, both carried by `PLACEHOLDERS` itself:
+
+    * **Case is the signal.** A marker is an all-caps token and is matched
+      case-sensitively (`TODO`, `TODO:`, `[TODO]`, `(TODO)`, `TODO -` — the
+      boundary is "not a letter or a digit"). Boilerplate prose stays
+      case-insensitive, because "Lorem Ipsum" is the same filler either way.
+    * **Tag boundaries are preserved, not closed up.** `text` is the runs
+      concatenated, which is what inline layout does and what the punctuation
+      rules are built on; a `tokenwise` pattern is matched against the runs
+      joined by a space instead, so `<span>TO</span><span>DO</span>` cannot
+      manufacture a marker. Joining never splits a run, so it cannot hide a
+      real one.
+    """
+    spaced = re.sub(r"\s+", " ", " ".join(runs if runs is not None else [text])).strip()
+    hits = []
+    for pattern, tokenwise, label in PLACEHOLDERS:
+        m = pattern.search(spaced if tokenwise else text)
+        if m:
+            hits.append((label, m.group(0)))
+    return hits
+
+
 def adjacency_slips(runs: list[str]) -> list[tuple[str, str, str]]:
     """(rule, quoted fragment, run) for punctuation spacing faults.
 
@@ -549,8 +581,8 @@ def analyse(sess, url: str, cfg: AuditConfig, spell=None) -> dict:
                 fix = f" -> “{correction}”" if correction else ""
                 add("misspelling", f"“{text[m.start():m.end()]}”{fix}", text, where)
 
-        for pattern, label in PLACEHOLDERS:
-            if re.search(pattern, low, re.I) and ("ph", label, where) not in seen:
+        for label, _matched in placeholder_hits(text, runs):
+            if ("ph", label, where) not in seen:
                 seen.add(("ph", label, where))
                 add("placeholder", label, text, where)
 

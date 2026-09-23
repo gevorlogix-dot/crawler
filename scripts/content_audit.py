@@ -127,27 +127,35 @@ TYPOS = {
 }
 
 # Elementor / theme / CMS boilerplate that should never reach production copy.
+#
+# Compiled with their own case sensitivity, and matched against the text as
+# published rather than a lower-cased copy of it: a developer's marker is an
+# all-caps token, and `to ?do:` matched case-insensitively is the ordinary
+# phrase "to do:" — every "What to do:" label on a page came back as
+# `'TODO' left in copy`. Same rule, same reason, as `audit/copyrules.py`.
+_MARK = r"(?<![A-Za-z0-9]){}(?![A-Za-z0-9])".format
 PLACEHOLDERS = [
-    (r"lorem ipsum", "Lorem ipsum filler text"),
-    (r"add your heading text here", "Elementor default heading placeholder"),
-    (r"click edit button to change this text", "Elementor default text-editor placeholder"),
-    (r"this is the heading", "Elementor default heading placeholder"),
-    (r"insert your (content|text) here", "Unreplaced template placeholder"),
-    (r"your text here", "Unreplaced template placeholder"),
-    (r"sample (text|page|heading)", "Sample content left in place"),
-    (r"\bplaceholder\b", "Literal word 'placeholder' in copy"),
-    (r"\btbd\b", "'TBD' left in copy"),
-    (r"\bto ?do:", "'TODO' left in copy"),
-    (r"\bcoming soon\b", "'Coming soon' stub"),
-    (r"\bxxx+\b", "'XXX' placeholder"),
-    (r"\btest(ing)? (page|content|post)\b", "Test content"),
-    (r"\bdummy (text|content)\b", "Dummy content"),
-    (r"\[your ", "Unfilled merge field"),
-    (r"\{\{.*?\}\}", "Unrendered template token"),
-    (r"%[A-Z_]{3,}%", "Unrendered template token"),
-    (r"\bundefined\b", "Literal 'undefined' rendered into copy"),
-    (r"\bnull\b(?![ -]?(and|void))", "Literal 'null' rendered into copy"),
-    (r"\bNaN\b", "Literal 'NaN' rendered into copy"),
+    (re.compile(r"lorem ipsum", re.I), "Lorem ipsum filler text"),
+    (re.compile(r"add your heading text here", re.I), "Elementor default heading placeholder"),
+    (re.compile(r"click edit button to change this text", re.I), "Elementor default text-editor placeholder"),
+    (re.compile(r"this is the heading", re.I), "Elementor default heading placeholder"),
+    (re.compile(r"insert your (content|text) here", re.I), "Unreplaced template placeholder"),
+    (re.compile(r"your text here", re.I), "Unreplaced template placeholder"),
+    (re.compile(r"sample (text|page|heading)", re.I), "Sample content left in place"),
+    (re.compile(r"\bplaceholder\b", re.I), "Literal word 'placeholder' in copy"),
+    (re.compile(_MARK("TBD")), "'TBD' left in copy"),
+    (re.compile(_MARK("TODO")), "'TODO' left in copy"),
+    (re.compile(_MARK("FIXME")), "'FIXME' left in copy"),
+    (re.compile(r"\bcoming soon\b", re.I), "'Coming soon' stub"),
+    (re.compile(_MARK("XXX+")), "'XXX' placeholder"),
+    (re.compile(r"\btest(ing)? (page|content|post)\b", re.I), "Test content"),
+    (re.compile(r"\bdummy (text|content)\b", re.I), "Dummy content"),
+    (re.compile(r"\[your ", re.I), "Unfilled merge field"),
+    (re.compile(r"\{\{.*?\}\}"), "Unrendered template token"),
+    (re.compile(r"%[A-Z_]{3,}%"), "Unrendered template token"),
+    (re.compile(r"\bundefined\b"), "Literal 'undefined' rendered into copy"),
+    (re.compile(r"\bnull\b(?![ -]?(and|void))"), "Literal 'null' rendered into copy"),
+    (re.compile(r"\bNaN\b"), "Literal 'NaN' rendered into copy"),
 ]
 
 # Encoding damage: UTF-8 read as cp1252 and re-encoded.
@@ -319,7 +327,7 @@ def audit_page(url: str, spell) -> dict:
                 add("misspelling", sev, f"“{text[m.start():m.end()]}”{fix}", text, region)
 
         for pattern, label in PLACEHOLDERS:
-            m = re.search(pattern, low, re.I)
+            m = pattern.search(text)
             if m:
                 key = ("placeholder", label, region)
                 if key not in seen_finding:

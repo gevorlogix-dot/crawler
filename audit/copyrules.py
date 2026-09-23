@@ -7,6 +7,9 @@ is worse than no rule, because it teaches the reader to ignore the section.
 
 from __future__ import annotations
 
+import re
+from typing import NamedTuple
+
 # ------------------------------------------------------------------ typos
 
 # Misspellings worth flagging anywhere. `None` means "regional/style note"
@@ -78,29 +81,80 @@ TYPOS: dict[str, str | None] = {
 
 # ------------------------------------------------------------- placeholders
 
-PLACEHOLDERS: list[tuple[str, str]] = [
-    (r"lorem ipsum", "Lorem ipsum filler text"),
-    (r"dolor sit amet", "Lorem ipsum filler text"),
-    (r"add your heading text here", "Elementor default heading placeholder"),
-    (r"click edit button to change this text", "Elementor default text placeholder"),
-    (r"this is the heading", "Page-builder default heading"),
-    (r"insert your (content|text|image) here", "Unreplaced template placeholder"),
-    (r"your (text|content) here", "Unreplaced template placeholder"),
-    (r"sample (text|page|heading|content)", "Sample content left in place"),
-    (r"\bplaceholder text\b", "Literal 'placeholder text' in copy"),
-    (r"\btbd\b", "'TBD' left in copy"),
-    (r"\bto ?do:", "'TODO' left in copy"),
-    (r"\bcoming soon\b", "'Coming soon' stub"),
-    (r"\bxxx+\b", "'XXX' placeholder"),
-    (r"\bdummy (text|content)\b", "Dummy content"),
-    (r"\[your [a-z ]{2,20}\]", "Unfilled merge field"),
-    (r"\{\{[^}]{1,40}\}\}", "Unrendered template token"),
-    (r"%[A-Z_]{3,}%", "Unrendered template token"),
-    (r"\bundefined\b", "Literal 'undefined' rendered into copy"),
-    (r"\bNaN\b", "Literal 'NaN' rendered into copy"),
-    (r"\[object Object\]", "Literal '[object Object]' rendered into copy"),
-    (r"\berror:? ?undefined\b", "Error text rendered into copy"),
-]
+# A developer's marker is an all-caps token, and it is the *only* thing these
+# patterns may match. `TODO` matched case-insensitively — and with `to ?do:`,
+# which allows a space — is the phrase "to do:", so a travel site's "What to do:
+# Walk the beach" and every "things to do" sentence came back as `'TODO' left in
+# copy`. On one page all three reported markers were that phrase and the page
+# contains no marker at all. Same class of mistake as `MISSING_SPACE`'s
+# three-letter minimum: nearly right on the invented case, silently wrong on the
+# real one.
+#
+# So a marker is matched **case-sensitively**, as a standalone token: `TODO`,
+# `TODO:`, `[TODO]`, `(TODO)` and `TODO -` all match, because the boundary is
+# "not a letter or a digit"; `to do`, `to&nbsp;do`, `to<br>do` and `Todo` do not,
+# whatever the surrounding markup does. Lower-casing the page before matching is
+# what made that impossible, so `PLACEHOLDERS` carries compiled patterns and each
+# one states its own case sensitivity — the prose entries below stay
+# case-insensitive, because "Lorem Ipsum" is the same filler as "lorem ipsum".
+#
+# `tokenwise` is the second half of the same rule: a marker is one token, so it
+# lives inside one text node, and the caller matches it against text whose tag
+# boundaries are preserved as spaces rather than closed up. `block_text`
+# concatenates the runs — which is right for prose, and is why the punctuation
+# rules are built on it — but that means `<span>TO</span><span>DO</span>` reads
+# as `TODO`. Preserving the boundary cannot hide a real marker (it never splits a
+# run) and it removes the one way markup can manufacture one.
+
+
+def _marker(word: str) -> tuple[re.Pattern[str], bool]:
+    """An all-caps marker token: case-sensitive, letters and digits either side."""
+    return re.compile(rf"(?<![A-Za-z0-9]){word}(?![A-Za-z0-9])"), True
+
+
+def _prose(pattern: str) -> tuple[re.Pattern[str], bool]:
+    """Boilerplate a CMS ships as prose — case carries no meaning, so ignore it."""
+    return re.compile(pattern, re.IGNORECASE), False
+
+
+def _literal(pattern: str) -> tuple[re.Pattern[str], bool]:
+    """Output written by a machine, which writes it in exactly one case."""
+    return re.compile(pattern), True
+
+
+class Placeholder(NamedTuple):
+    pattern: re.Pattern[str]
+    tokenwise: bool
+    label: str
+
+
+PLACEHOLDERS: list[Placeholder] = [Placeholder(*p, label) for p, label in [
+    (_prose(r"lorem ipsum"), "Lorem ipsum filler text"),
+    (_prose(r"dolor sit amet"), "Lorem ipsum filler text"),
+    (_prose(r"add your heading text here"), "Elementor default heading placeholder"),
+    (_prose(r"click edit button to change this text"), "Elementor default text placeholder"),
+    (_prose(r"this is the heading"), "Page-builder default heading"),
+    (_prose(r"insert your (content|text|image) here"), "Unreplaced template placeholder"),
+    (_prose(r"your (text|content) here"), "Unreplaced template placeholder"),
+    (_prose(r"sample (text|page|heading|content)"), "Sample content left in place"),
+    (_prose(r"\bplaceholder text\b"), "Literal 'placeholder text' in copy"),
+    (_marker("TBD"), "'TBD' left in copy"),
+    (_marker("TODO"), "'TODO' left in copy"),
+    (_marker("FIXME"), "'FIXME' left in copy"),
+    (_prose(r"\bcoming soon\b"), "'Coming soon' stub"),
+    (_marker("XXX+"), "'XXX' placeholder"),
+    (_prose(r"\bdummy (text|content)\b"), "Dummy content"),
+    (_prose(r"\[your [a-z ]{2,20}\]"), "Unfilled merge field"),
+    (_literal(r"\{\{[^}]{1,40}\}\}"), "Unrendered template token"),
+    (_literal(r"%[A-Z_]{3,}%"), "Unrendered template token"),
+    # Written by JavaScript, which writes them in exactly one case. Matched
+    # case-insensitively, `undefined` is an ordinary English adjective and `NaN`
+    # is the name Nan.
+    (_literal(r"\bundefined\b"), "Literal 'undefined' rendered into copy"),
+    (_literal(r"\bNaN\b"), "Literal 'NaN' rendered into copy"),
+    (_literal(r"\[object Object\]"), "Literal '[object Object]' rendered into copy"),
+    (_prose(r"\berror:? ?undefined\b"), "Error text rendered into copy"),
+]]
 
 # --------------------------------------------------------------- mojibake
 

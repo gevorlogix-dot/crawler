@@ -298,7 +298,7 @@ The rules that make the number defensible, and which are easy to quietly break:
 
 ### Tests for the engine (`tests/unit/`, marker `unit`)
 
-`python -m pytest -m unit` — 740 tests, no browser and no network. The root
+`python -m pytest -m unit` — 774 tests, no browser and no network. The root
 `conftest.py` has an autouse `_page_defaults(page)` fixture that would launch
 Chromium for anything under `tests/`, so `tests/unit/conftest.py` overrides it
 with a no-op; a fixture from the nearest conftest wins. What is pinned:
@@ -355,6 +355,12 @@ it prevents:
   `unknown_words` being dead data, and a `NameError` nothing carried out of the
   run. The other 40 tests are precision, one per measured false-positive class,
   with the recall cost of the near-miss gate pinned beside them.
+- `test_placeholder_markers.py` — that a marker is an all-caps token and not the
+  phrase "to do". The three false positives a reader quoted are pinned verbatim,
+  beside the markup that could fuse two words into a marker and the real markers
+  — `TODO`, `TODO:`, `[TODO]`, lorem ipsum, `NaN`, `[object Object]` — that must
+  keep firing. The neighbours that carried the same bug get a test each: `Nan`,
+  `Undefined`, `%off%`, `XXXL`.
 - `test_reputation.py` — the two directions the vendor count is wrong in, one
   test each: four heuristic feeds must be **low** with no gate, and one Google
   listing must be **critical** with the gate, out of the same 89. Plus the tier
@@ -471,6 +477,42 @@ it prevents:
 - **The dedup key for a punctuation slip is the quoted words, not the block.**
   `text_blocks` reports a paragraph and a `<span>` inside it as two blocks, so one
   slip in the nested one arrived as two identical rows.
+- **A placeholder marker is an all-caps token, and case is the whole signal**
+  (`extract.placeholder_hits`, `copyrules.PLACEHOLDERS`). `\bto ?do:` matched
+  with `re.IGNORECASE` against `text.lower()` is the ordinary English phrase
+  "to do:", so a travel site's every "What to do:" label and every "things to
+  do" sentence came back as `'TODO' left in copy` — **22 blocks on one page**,
+  which is the whole of that site's `CNT-01`, a **critical** finding, about a
+  page whose source contains the string `TODO` zero times. Lower-casing the page
+  before matching removes the only thing that separates a marker from the
+  phrase, and nothing downstream can put it back — which is how the pattern came
+  to be *widened* to `to ?do:` in the first place. So `PLACEHOLDERS` carries
+  compiled patterns, each stating its own case sensitivity: `_marker` for an
+  all-caps token (`TODO`, `TODO:`, `[TODO]`, `(TODO)`, `TODO -` — the boundary
+  is "not a letter or a digit", so `Todo`, `todo`, `TODOS` and `to do` are not
+  markers), `_literal` for output a machine writes in exactly one case, and
+  `_prose` for CMS boilerplate where case carries no meaning. The same bug was
+  under `\bxxx+\b` (any lower-case `xxx`), `%[A-Z_]{3,}%` (matched `%off%`),
+  `\bNaN\b` (matched the name Nan) and `\bundefined\b` (an ordinary English
+  adjective), and `scripts/content_audit.py` carried its own copy of the list.
+  Same class of mistake as `MISSING_SPACE`'s three-letter minimum and
+  `mailauth`'s `all` substring: nearly right on the invented case, silently
+  wrong on the real one.
+- **A marker is matched with tag boundaries preserved, not closed up.**
+  `block_text` concatenates the runs — correct for prose, and what the
+  punctuation rules are built on — but that makes
+  `<span>TO</span><span>DO</span>` read as `TODO`. A `tokenwise` pattern is
+  matched against the runs joined by a space instead. Joining never splits a
+  run, so it cannot hide a real marker, and it removes the one way markup can
+  manufacture one. `<br>` and `&nbsp;` already render as spaces, so
+  `What to<br>do` was never at risk from that direction — only from the case.
+- **`placeholder_hits` is a module-level function**, for the reason
+  `spelling_slips` is: inline in `analyse` the rule was reachable only through
+  an HTTP session, which is why nothing tested it and why it spent the life of
+  the tool reporting a heading as a developer's marker.
+  `tests/unit/test_placeholder_markers.py` drives it directly — the reader's
+  three quoted false positives verbatim, the markup shapes either side of them,
+  and the real markers that must keep firing.
 - **A copy finding has to quote the sentence.** "Space before a punctuation mark"
   names the rule and not the fault; on a 2,000-word article it sends the reader
   hunting. Details carry the fragment either side of the slip
