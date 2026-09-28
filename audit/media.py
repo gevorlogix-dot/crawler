@@ -33,8 +33,9 @@ embedded thumbnail — no external asset, no second request at read time.
 from __future__ import annotations
 
 import io
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlsplit, urlunsplit
 
 import requests
 
@@ -136,6 +137,64 @@ def image_urls(records: list[dict]) -> dict:
         for src in (r.get("images") or {}):
             pages.setdefault(src, []).append(r["url"])
     return dict(sorted(pages.items(), key=lambda kv: -len(kv[1])))
+
+
+# Image optimizers that wrap the real file in a query parameter. The wrapped URL
+# is the image; the wrapper's `w=`/`q=` only say which rendition was cut from it.
+OPTIMIZER_PATHS = ("/_next/image", "/_vercel/image")
+# WordPress writes every media-library size as `name-300x200.jpg`, and the alt
+# text belongs to the attachment, not to one of its sizes.
+WP_SIZE_SUFFIX = re.compile(r"-\d{2,5}x\d{2,5}(?=\.[A-Za-z0-9]{2,5}$)")
+ALT_RANK = {"missing": 2, "empty": 1, "text": 0}
+
+
+def image_identity(url: str) -> str:
+    """Which image a URL is, independent of the rendition requested.
+
+    The alt-text check counts **images**, and one image reaches a site as many
+    URLs: a Next.js optimizer URL per width (`/_next/image?url=%2Fflag.webp&w=32`
+    and `…&w=64`), a Cloudflare `/cdn-cgi/image/<options>/` prefix, a WordPress
+    `-300x200` size. Anything else is left exactly as written — a query string
+    can be the identity (`image.php?id=3`), so it is never stripped blind.
+    """
+    parts = urlsplit(url)
+    path = parts.path.rstrip("/") or parts.path
+    if path in OPTIMIZER_PATHS:
+        inner = parse_qs(parts.query).get("url", [""])[0]
+        if inner:
+            return image_identity(urljoin(url, inner))
+    if parts.path.startswith("/cdn-cgi/image/"):
+        rest = parts.path[len("/cdn-cgi/image/"):].split("/", 1)
+        if len(rest) == 2 and rest[1]:
+            inner = rest[1] if "://" in rest[1] else "/" + rest[1]
+            return image_identity(urljoin(url, inner))
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+                       WP_SIZE_SUFFIX.sub("", parts.path), parts.query, ""))
+
+
+def alt_inventory(pages: list[dict]) -> dict:
+    """Every distinct image on the site, with its alt state and where it appears.
+
+    `img_total`/`img_empty_alt` count `<img>` **tags**, and summed across pages
+    that counts a header, menu or footer image once per page it appears on: 48
+    decorative state flags in a shared jurisdiction menu, each `alt=""`, became
+    "2,376 images have an empty alt" on a site with a few hundred images. The
+    unit here is the image (`image_identity`), and an image is as bad as its worst
+    occurrence — one page leaving it undescribed is still a place to fix it.
+
+    Returns `{identity: {"state", "pages": [urls where it lacks text], "seen":
+    n pages carrying it}}`, from each page's `img_alts`.
+    """
+    out: dict[str, dict] = {}
+    for r in pages:
+        for ident, state in (r.get("img_alts") or {}).items():
+            row = out.setdefault(ident, {"state": "text", "pages": [], "seen": 0})
+            row["seen"] += 1
+            if state != "text":
+                row["pages"].append(r["url"])
+            if ALT_RANK[state] > ALT_RANK[row["state"]]:
+                row["state"] = state
+    return out
 
 
 def image_markup(records: list[dict]) -> dict:

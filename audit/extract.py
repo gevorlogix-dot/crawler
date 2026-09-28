@@ -20,6 +20,7 @@ from .copyrules import (APOSTROPHES, MOJIBAKE, PLACEHOLDERS, TYPOS,
                         SPELL_WHITELIST, WORD_JOINERS)
 from . import srcset as srcset_mod
 from .fetch import is_page, normalise, refusal, same_site
+from .media import ALT_RANK, image_identity
 from .schema_validate import validate_page
 
 # Images per page kept for weight measurement. A page with more distinct images
@@ -381,6 +382,33 @@ def spelling_slips(blocks, url: str, spell) -> list[dict]:
     return out
 
 
+def alt_state(img) -> str:
+    """`missing` (no attribute), `empty` (present and blank) or `text`."""
+    alt = img.get("alt")
+    if alt is None:
+        return "missing"
+    return "text" if alt.strip() else "empty"
+
+
+def img_alts(imgs, doc_base: str, page_url: str) -> dict[str, str]:
+    """{image identity: worst alt state on this page}, one entry per image.
+
+    Keyed by `media.image_identity` of the rendition a visitor is served, so the
+    same file in a shared header, menu or footer is the same key on every page
+    and `media.alt_inventory` can count it once. An `<img>` with nothing
+    fetchable (a `data:` URI, no `src`) cannot be matched across pages and is
+    keyed to its position on this one.
+    """
+    out: dict[str, str] = {}
+    for n, img in enumerate(imgs):
+        choice = srcset_mod.select(img, doc_base)
+        key = image_identity(choice.typical) if choice else f"{page_url}#img{n}"
+        state = alt_state(img)
+        if ALT_RANK[state] >= ALT_RANK.get(out.get(key, "text"), 0):
+            out[key] = state
+    return out
+
+
 def analyse(sess, url: str, cfg: AuditConfig, spell=None) -> dict:
     rec: dict = {"url": url, "findings": [], "links": [], "unknown_words": {}}
     t0 = time.time()
@@ -494,8 +522,11 @@ def analyse(sess, url: str, cfg: AuditConfig, spell=None) -> dict:
     # ---------------------------------------------------------- media
     imgs = soup.find_all("img")
     rec["img_total"] = len(imgs)
-    rec["img_no_alt"] = sum(1 for i in imgs if i.get("alt") is None)
-    rec["img_empty_alt"] = sum(1 for i in imgs if (i.get("alt") or "").strip() == "")
+    rec["img_no_alt"] = sum(1 for i in imgs if alt_state(i) == "missing")
+    # Present and blank. A missing attribute is not also an empty one: counting
+    # it under both subtracted it twice from the described share.
+    rec["img_empty_alt"] = sum(1 for i in imgs if alt_state(i) == "empty")
+    rec["img_alts"] = img_alts(imgs, doc_base, url)
     rec["img_no_dims"] = sum(1 for i in imgs if not i.get("width") or not i.get("height"))
 
     # Every distinct image the page asks for, so its transferred weight can be

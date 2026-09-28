@@ -1578,7 +1578,8 @@ def _content(ctx, result) -> Group:
         "from a shared template or block — fix it there rather than page by page.",
         ("CNT-02",)))
 
-    imgs = sum(r.get("img_total", 0) for r in ctx.pages)
+    inv = media_mod.alt_inventory(ctx.pages)
+    imgs = len(inv)
     if imgs:
         # Scored on *descriptive* alt — a non-empty one — not merely on the
         # attribute being present. Across the audited corpus the attribute is
@@ -1587,13 +1588,18 @@ def _content(ctx, result) -> Group:
         # real difference between sites. An empty `alt=""` is legitimate for
         # decorative art, which is why the window is forgiving rather than tight:
         # some empty alts are correct, and a site full of them is not.
-        no_alt = sum(r.get("img_no_alt", 0) for r in ctx.pages)
-        empty = sum(r.get("img_empty_alt", 0) for r in ctx.pages)
+        #
+        # The unit is the distinct image, not the `<img>` tag. Summed per page,
+        # 48 decorative flags in a shared menu counted 2,376 times and graded a
+        # site on its template rather than its images — the same share MED-01
+        # now reports in its headline.
+        no_alt = sum(1 for v in inv.values() if v["state"] == "missing")
+        empty = sum(1 for v in inv.values() if v["state"] == "empty")
         described_imgs = imgs - no_alt - empty
         g.metrics.append(Metric(
             "img_alt", "Images with descriptive alt text", 3,
             win("img_alt", described_imgs / imgs),
-            f"{described_imgs} of {imgs} images"
+            f"{described_imgs} of {imgs} distinct images"
             + (f"; {empty} carry an empty alt" if empty else "")
             + (f", {no_alt} no attribute at all" if no_alt else ""),
             "≥95% of images",

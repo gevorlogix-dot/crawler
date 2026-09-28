@@ -146,7 +146,8 @@ def audit_url(url: str) -> dict:
     imgs = soup.find_all("img")
     rec["img_total"] = len(imgs)
     rec["img_no_alt"] = sum(1 for i in imgs if i.get("alt") is None)
-    rec["img_empty_alt"] = sum(1 for i in imgs if (i.get("alt") or "").strip() == "")
+    rec["img_empty_alt"] = sum(1 for i in imgs
+                               if i.get("alt") is not None and not i["alt"].strip())
     rec["img_no_dims"] = sum(1 for i in imgs if not i.get("width") or not i.get("height"))
     rec["img_no_lazy"] = sum(1 for i in imgs if not i.get("loading"))
 

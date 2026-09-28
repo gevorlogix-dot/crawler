@@ -49,6 +49,7 @@ def page(path, *, title, desc, links=(), words=800, schema=True, status=200):
         "og_title": title, "og_description": desc, "og_image": f"{BASE}/og.png",
         "twitter_card": "summary_large_image",
         "word_count": words, "img_total": 4, "img_no_alt": 0, "img_empty_alt": 0,
+        "img_alts": {f"{BASE}/img/{n}.jpg": "text" for n in range(4)},
         "links": [(f"{BASE}{t}", "main", text) for t, text in links],
         "schema_items": [{"type": "WebPage"}] if schema else [],
         "schema_types": ["WebPage"] if schema else [],

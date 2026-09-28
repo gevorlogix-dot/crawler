@@ -155,10 +155,19 @@ def ratios(data: dict) -> dict[str, float]:
                                      for p in described])
         out["desc_length"] = sum(1 for p in described
                                  if 70 <= p["desc_len"] <= 160) / len(described)
-    if imgs:
-        # Descriptive alt, matching the metric: an empty alt is not a description.
+    alt = data.get("alt_text") or {}
+    if alt.get("distinct"):
+        # Distinct images, matching the metric. A shared menu image counted once
+        # per page graded the template rather than the site's images.
+        out["img_alt"] = ((alt["distinct"] - alt["missing"] - alt["empty"])
+                          / alt["distinct"])
+    elif imgs:
+        # A file written before `alt_text` existed: only tag counts, which
+        # over-weight shared header/menu/footer images. Descriptive alt, matching
+        # the metric: an empty alt is not a description. Older extractions also
+        # counted a missing attribute as empty, so it is not subtracted twice.
         empty = sum(p.get("img_empty_alt", 0) for p in pages)
-        out["img_alt"] = (imgs - no_alt - empty) / imgs
+        out["img_alt"] = max(0.0, imgs - max(empty, no_alt)) / imgs
     # Recovered from the findings, which record every URL they fired on. Without
     # this, half the table reads "not recoverable" and the calibration check only
     # covers the metrics that happen to be per-page fields.

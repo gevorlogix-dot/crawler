@@ -2898,14 +2898,112 @@ def schema_recommended(ctx: Ctx):
 # Media and performance
 # =====================================================================
 
+def _plural(n: int, one: str, many: str = "") -> str:
+    return f"{n:,} {one if n == 1 else (many or one + 's')}"
+
+
+def _alt_groups(inv: dict) -> list[dict]:
+    """The undescribed images, grouped so one row is one thing to edit.
+
+    Grouped by alt state and by the folder the file lives in — a menu's icons,
+    a template's hero images, a theme's badges each come from one place — and
+    then described by how the images in the group actually co-occur, because a
+    folder alone proves nothing (a WordPress month folder holds whatever was
+    uploaded that month). Grouping on the *exact* page set was tried first and
+    split a 48-flag menu into 48 rows: each flag is left out of the menu on its
+    own state's page, so no two flags share a page set.
+    """
+    groups: dict[tuple, list[str]] = {}
+    for ident, row in inv.items():
+        if row["state"] == "text":
+            continue
+        folder = ident.split("?", 1)[0].rsplit("/", 1)[0]
+        groups.setdefault((row["state"], folder), []).append(ident)
+    out = []
+    for (state, folder), ims in groups.items():
+        per = [set(inv[i]["pages"]) for i in ims]
+        union = set().union(*per)
+        out.append({"state": state, "folder": folder, "images": sorted(ims),
+                    "pages": sorted(union), "reach": [len(p) for p in per]})
+    # Missing before empty (the defect before the review item), then the
+    # widest-reaching group first, since that is the biggest single fix.
+    return sorted(out, key=lambda g: (g["state"] != "missing", -len(g["pages"]),
+                                      -len(g["images"]), g["images"][0]))
+
+
+def _alt_shared(g: dict) -> bool:
+    """True when a group's images appear *together*: one component on many pages.
+
+    Every image on at least 80% of the pages the group spans. A flag menu that
+    drops the current state's own flag is still one menu; images that each sit
+    on their own page are one template slot, not one component.
+    """
+    return (len(g["images"]) > 1 and len(g["pages"]) > 1
+            and min(g["reach"]) >= 0.8 * len(g["pages"]))
+
+
+def _alt_where(g: dict, base: str) -> str:
+    n, m = len(g["images"]), len(g["pages"])
+    lo, hi = min(g["reach"]), max(g["reach"])
+    if m == 1:
+        return f"on {_short_url(g['pages'][0], base)}"
+    if n == 1:
+        return f"on {m} pages"
+    if _alt_shared(g):
+        span = (f"all on the same {m} pages" if lo == m
+                else f"together across {m} pages (each on {lo}–{hi} of them)"
+                if lo != hi else f"together across {m} pages (each on {lo} of them)")
+        return span + " — one shared component"
+    if hi == 1:
+        return f"each on a different page, across {m} pages — one template slot"
+    return f"across {m} pages (each on {lo}–{hi} of them)"
+
+
+def _alt_evidence(groups: list[dict], base: str) -> str:
+    lines = []
+    for g in groups:
+        what = "no alt attribute" if g["state"] == "missing" else 'an empty alt=""'
+        lines.append(f"{_plural(len(g['images']), 'image')} with {what}, "
+                     f"{_alt_where(g, base)}:")
+        lines += [f"  {_short_url(u, base)}" for u in g["images"]]
+    return "\n".join(lines)
+
+
+def _short_url(url: str, base: str) -> str:
+    """Drop the audited origin from a URL, and nothing else."""
+    origin = urlparse(base)
+    parts = urlparse(url)
+    if parts.netloc.lower().removeprefix("www.") == origin.netloc.lower().removeprefix("www."):
+        return url[len(f"{parts.scheme}://{parts.netloc}"):] or "/"
+    return url
+
+
 @check
 def image_alt(ctx: Ctx):
-    hits = [Hit(r["url"], f"{r['img_no_alt']} missing, {r['img_empty_alt']} empty, "
-                          f"of {r['img_total']} images")
-            for r in ctx.pages
-            if r.get("img_no_alt", 0) > 0 or r.get("img_empty_alt", 0) > 0]
-    if not hits:
+    """Images with no alt text — counted once per image, not once per page.
+
+    Summing each page's `<img>` tags counts a shared header, menu or footer image
+    again on every page it appears on: 48 decorative flag icons in a jurisdiction
+    menu read as "2,376 images have an empty alt" on a site with a few hundred
+    images in all. The headline counts distinct images (`media.alt_inventory`),
+    the evidence lists each of them once, grouped by the component carrying them,
+    and the tag totals stay in the prose as the secondary number they are.
+    """
+    inv = media_mod.alt_inventory(ctx.pages)
+    groups = _alt_groups(inv)
+    if not groups:
         return None
+    shared = {i for g in groups if _alt_shared(g) for i in g["images"]}
+    hits = []
+    for r in ctx.pages:
+        bad = {i: st for i, st in (r.get("img_alts") or {}).items() if st != "text"}
+        if not bad:
+            continue
+        miss = sum(1 for st in bad.values() if st == "missing")
+        on_others = sum(1 for i in bad if i in shared)
+        hits.append(Hit(r["url"], f"{miss} missing, {len(bad) - miss} empty, "
+                                  f"of {len(r['img_alts'])} images"
+                        + (f" · {on_others} shared" if on_others else "")))
     targets = []
     for r in ctx.pages:
         if len(targets) >= 2:
@@ -2917,21 +3015,35 @@ def image_alt(ctx: Ctx):
                     caption="This image carries no <code>alt</code> — decide whether "
                             "it says something, or is decoration."))
                 break
-    total_missing = sum(r.get("img_no_alt", 0) for r in ctx.pages)
-    total_empty = sum(r.get("img_empty_alt", 0) for r in ctx.pages)
-    total_imgs = sum(r.get("img_total", 0) for r in ctx.pages)
+    missing = sum(len(g["images"]) for g in groups if g["state"] == "missing")
+    empty = sum(len(g["images"]) for g in groups if g["state"] == "empty")
+    tags = sum(r.get("img_total", 0) for r in ctx.pages)
+    comp = [g for g in groups if _alt_shared(g)]
+    comp_note = ""
+    if comp:
+        big = comp[0]
+        comp_note = (f" {len(big['images'])} of them appear together across "
+                     f"{len(big['pages'])} pages — one shared component, so one "
+                     "template edit rather than a page-by-page job.")
     return Finding(
         "MED-01", "medium", "Media and performance",
-        f"{total_missing + total_empty} of {total_imgs} images have no alt text",
-        f"{total_missing} images have no <code>alt</code> attribute at all; "
-        f"{total_empty} have an empty one. Empty alt is correct for purely "
-        "decorative images, so treat this as a review list rather than a defect list.",
+        f"{missing + empty:,} of {len(inv):,} distinct images have no alt text",
+        f"Counted once per image, not once per page it appears on: the "
+        f"{_plural(ctx.n, 'page')} carry {tags:,} <code>&lt;img&gt;</code> tags, "
+        f"which are {_plural(len(inv), 'distinct image')}. "
+        f"{_plural(missing, 'image has', 'images have')} no <code>alt</code> "
+        f"attribute at all; {_plural(empty, 'has', 'have')} an empty one."
+        + comp_note
+        + " Empty alt is correct for purely decorative images, so treat those as "
+          "a review list rather than a defect list.",
         "Alt text is how a screen-reader user perceives the image, and it is the "
         "primary signal for ranking in image search. An image carrying real meaning "
         "with no alt is invisible to both.",
         "Describe every image that conveys information; keep <code>alt=\"\"</code> "
-        "for genuine decoration so screen readers skip it.",
-        hits, targets=targets)
+        "for genuine decoration so screen readers skip it. Where an image sits beside "
+        "text that already names it — a flag next to the state's name, an icon in "
+        "a labelled button — the empty alt is the right answer and needs no change.",
+        hits, evidence=_alt_evidence(groups, ctx.cfg.base), targets=targets)
 
 
 @check

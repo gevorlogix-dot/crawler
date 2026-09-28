@@ -298,7 +298,7 @@ The rules that make the number defensible, and which are easy to quietly break:
 
 ### Tests for the engine (`tests/unit/`, marker `unit`)
 
-`python -m pytest -m unit` — 774 tests, no browser and no network. The root
+`python -m pytest -m unit` — 783 tests, no browser and no network. The root
 `conftest.py` has an autouse `_page_defaults(page)` fixture that would launch
 Chromium for anything under `tests/`, so `tests/unit/conftest.py` overrides it
 with a no-op; a fixture from the nearest conftest wins. What is pinned:
@@ -408,6 +408,13 @@ it prevents:
   `pct` below 100, the spam/phishing split (one listing never charged twice),
   a row dropped when its tier never answered, and that no title carries
   markup.
+- `test_alt_inventory.py` — alt text counted per image, not per `<img>` tag.
+  The flag menu that read as 2,376 images, pinned in its live shape: each
+  jurisdiction page drops its own flag from the menu, so grouping on the exact
+  page set split it into one row per flag. Plus rendition identity (Next.js
+  optimizer widths, WordPress `-300x200`, Cloudflare `/cdn-cgi/image/`, a query
+  string that *is* the identity), worst-occurrence-wins, a missing `alt` not
+  also counted as empty, and a WordPress month folder not called a component.
 - `test_false_positives.py` — the crawler's own trailing slash, the framework
   catch-all read as a WordPress route, the hostname guess that capped a QA host
   at 25/100, the `aria-hidden` controls counted as unlabelled, and the WAF
@@ -1504,6 +1511,51 @@ overstatement the image stage ever had.
   shown at 30px" finding that meant nothing. `media.vector()` gates this, and
   `MED-06` gives SVGs their own fix advice (optimise the path data, or ship a
   small raster) because "re-encode as WebP at quality 75" is wrong for them.
+
+### Alt text is counted per image, not per tag (`MED-01`, `img_alt`)
+
+A reader pointed at **"0 images have no alt attribute at all; 2376 have an
+empty one"** on `irpregistrationservices.com` and said there are not 2,376
+images. There are 180. Every jurisdiction and services page carries the same
+jurisdiction menu of 48 state flags, 30px and `alt=""` beside each state's name,
+and `img_empty_alt` counted each `<img>` **tag**, summed across pages. A shared
+header, menu or footer image was counted once per page it appears on, and the
+score graded the template rather than the site's images.
+
+- **The unit is the distinct image** (`media.image_identity`). One file reaches
+  a site as many URLs, so the identity unwraps a Next.js/Vercel optimizer's
+  `url=` parameter and a Cloudflare `/cdn-cgi/image/<options>/` prefix, and
+  drops a WordPress `-300x200` size suffix, because alt text belongs to the
+  attachment and not to one of its sizes. Anything else is kept exactly as
+  written, query included, because `image.php?id=3` is an identity.
+- **Each page records `img_alts`** (`extract.img_alts`, `{identity: state}`),
+  and `media.alt_inventory` folds them into one row per image. **An image is as
+  bad as its worst occurrence**: described on one page and blank on another is
+  still a place to fix it. `MED-01`'s headline, its evidence and the `img_alt`
+  metric all count from that inventory, so they cannot disagree. The tag total
+  stays in the prose as the secondary number.
+- **A missing `alt` is not also an empty one.** `(alt or "").strip() == ""`
+  is true of `None`, so every missing attribute was counted under both, and the
+  score's `imgs - no_alt - empty` subtracted it twice. `extract.alt_state` is
+  three-valued. `scripts/seo_audit.py` had the same line and is fixed too.
+- **Evidence groups by what one edit fixes.** Undescribed images are grouped by
+  state and by folder, then described by how they actually co-occur, because
+  a folder alone proves nothing (a WordPress month folder holds whatever was
+  uploaded that month). A group is called **one shared component** only when
+  every image in it is on at least 80% of the pages the group spans
+  (`_alt_shared`). Grouping on the *exact* page set was tried first and failed
+  on the live site: each jurisdiction page drops its own flag from the menu, so
+  no two flags share a page set and the evidence came out as 94 one-image rows.
+  Images that each sit on a different page are **one template slot** (the 45
+  jurisdiction hero images). The live result is four groups: `truck1.webp` on
+  102 pages, 47 flags across 48 pages, 45 heroes, and one hero stored in a
+  different folder.
+- `data.json` carries `alt_text`: distinct, missing, empty, the tag count, and
+  one row per undescribed image with the pages it lacks text on. The per-page
+  `img_alts` maps are left out of `pages`. `score_calibration.py` reads
+  `alt_text` when present and falls back to tag counts for older files. The
+  `img_alt` window was calibrated on tag counts, so re-check it once the corpus
+  has been re-audited.
 
 ### Screenshots (`audit/shots.py`)
 

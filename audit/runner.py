@@ -647,6 +647,7 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
     result.report_path = report_path
 
     data_path = out_dir / "data.json"
+    alt_inv = media_mod.alt_inventory(ctx.pages)
     data_path.write_text(json.dumps({
         "base": cfg.base, "started": result.started, "finished": result.finished,
         "elapsed_s": result.elapsed_s, "method": method, "counts": counts,
@@ -836,6 +837,20 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
             "warnings": sum(r.get("schema_warnings") or 0 for r in ctx.pages),
             "pages_without": sum(1 for r in ctx.pages if not r.get("schema_items")),
         },
+        # Alt text per distinct image, which is the unit MED-01 and `img_alt`
+        # count in. The per-page `img_alts` maps are left out of `pages` below;
+        # this is the same information once per image instead of once per page.
+        "alt_text": {
+            "distinct": len(alt_inv),
+            "missing": sum(1 for v in alt_inv.values() if v["state"] == "missing"),
+            "empty": sum(1 for v in alt_inv.values() if v["state"] == "empty"),
+            "img_tags": sum(r.get("img_total", 0) for r in ctx.pages),
+            "undescribed": [{"image": u, "state": v["state"],
+                             "pages": len(v["pages"]), "seen_on": v["seen"]}
+                            for u, v in sorted(alt_inv.items(),
+                                               key=lambda kv: -len(kv[1]["pages"]))
+                            if v["state"] != "text"],
+        },
         "images": {
             "measured": len(images),
             "threshold_kb": cfg.image_max_kb,
@@ -867,7 +882,8 @@ def run_audit(cfg: AuditConfig, progress=lambda msg, frac=None: None,
         "pages": [{k: v for k, v in r.items()
                    if k not in ("links", "findings", "raw_internal", "raw_external",
                                 "link_hrefs",
-                                "unknown_words", "images", "schema_snippets")}
+                                "unknown_words", "images", "img_alts",
+                                "schema_snippets")}
                   for r in records],
     }, indent=2, default=str), encoding="utf-8")
     result.data_path = data_path
